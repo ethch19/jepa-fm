@@ -1,0 +1,17 @@
+[project]
+name = "jepa-fm"
+version = "0.1.0"
+description = "Foundation model using JEPA"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "nibabel>=5.4.2",
+    "pandas>=3.1.0",
+    "pyarrow>=26.0.0",
+    "torch>=2.15.0",
+    "torchvision>=0.29.2",
+]
+
+[tool.pyright]
+venvPath = "."
+venv = ".venv"
