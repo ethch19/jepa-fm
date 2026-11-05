@@ -7,6 +7,7 @@ from torchvision.transforms import v2
 
 _EXTENSIONS = ["csv", "parquet"]
 
+
 class PretrainDataset(Dataset):
     def __init__(self, meta_dir: str, views: int):
         self.meta_dir = Path(meta_dir)
@@ -35,7 +36,9 @@ class PretrainDataset(Dataset):
                 ).all()
 
                 invalid = tabular[~nii_only]
-                print(f"Invalid files found in dataframe: {invalid.to_markdown(index=False)}")
+                print(
+                    f"Invalid files found in dataframe: {invalid.to_markdown(index=False)}"
+                )
 
                 data_dfs.append(nii_only)
 
@@ -63,7 +66,15 @@ class PretrainDataset(Dataset):
         img = self._load_file(self.img_paths[idx])
         seg = self._load_file(self.seg_paths[idx])
 
-        return torch.stack([self.transform(img) for _ in range(self.V)]), self.subjects[idx]
+        # TODO: 3D volume patch containing tumour
+        # TODO: two views from different tumours
+        # - a separate function/class for tumour patch retrieval
+        # - can be adapted for same scan -> multiple tumours
+
+        return (
+            torch.stack([self.transform(img) for _ in range(self.V)]),
+            self.subjects[idx],
+        )
 
     def _load_file(file_path: str):
         img_path = Path(file_path)
@@ -73,6 +84,7 @@ class PretrainDataset(Dataset):
         else:
             raise RuntimeError(f"Non NIFTI-file found calling _load_file: {img_path}")
 
+    # TODO: replace with grayscale image transformations
     def _transform():
         return v2.Compose(
             [
