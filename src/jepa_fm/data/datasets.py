@@ -1,17 +1,35 @@
+import numpy as np
 import pandas as pd
-import nibabel as nib
 from pathlib import Path
 import torch
 from torch.utils.data import Dataset
 from torchvision.transforms import v2
+from typing import NamedTuple
+
+from jepa_fm.data.utils import SplitType, load_col_file, centroid_crop
 
 _EXTENSIONS = ["csv", "parquet"]
 
 
+class Lesion(NamedTuple):
+    uuid: str
+    npy_img_path: str
+    npy_mask_path: str
+    centroid: tuple[float, float, float]  # x, y, z
+
+
 class PretrainDataset(Dataset):
-    def __init__(self, meta_dir: str, views: int):
+    def __init__(
+        self,
+        split: SplitType,
+        meta_dir: str,
+        views: int,
+        crop_size: tuple[float, float, float],
+    ):
+        self.split = split
         self.meta_dir = Path(meta_dir)
         self.views = views
+        self.crop_size = crop_size
         if views > 1:
             self.transform = self._transform()
         else:
@@ -20,69 +38,79 @@ class PretrainDataset(Dataset):
         data_dfs = []
         for file in self.meta_dir.rglob("*"):
             if file.is_file and any(file.name.endswith(ext) for ext in _EXTENSIONS):
-                match file.suffix:
-                    case "csv":
-                        tabular = pd.read_csv(file)
-                    case "parquet":
-                        tabular = pd.read_parquet(
-                            file, columns=["subject_id", "img_path", "seg_path"]
-                        )
-                    case _:
-                        raise RuntimeError(f"Did not match any suffix for {file.name}")
+                tabular = load_col_file(
+                    file,
+                    cols=[
+                        "node_id",
+                        "scan_id",
+                        "cohort",
+                        "npy_img_path",
+                        "npy_seg_path",
+                        "centroid_x",
+                        "centroid_y",
+                        "centroid_z",
+                    ],
+                )
 
-                nii_only = (
-                    tabular["img_path"].astype(str).str.endswith(".nii.gz", na=False)
-                    & tabular["seg_path"].astype(str).str.endswith(".nii.gz", na=False)
+                npy_only = (
+                    tabular["npy_img_path"].astype(str).str.endswith(".npy", na=False)
+                    & tabular["npy_seg_path"].astype(str).str.endswith(".npy", na=False)
                 ).all()
 
-                invalid = tabular[~nii_only]
+                invalid = tabular[~npy_only]
                 print(
                     f"Invalid files found in dataframe: {invalid.to_markdown(index=False)}"
                 )
 
-                data_dfs.append(nii_only)
+                cohort_only = npy_only.loc[npy_only["cohort"] == self.split]
 
-        self.samples = (
-            pd.concat(data_dfs, ignore_index=True) if data_dfs else pd.DataFrame()
+                data_dfs.append(cohort_only)
+
+        samples = pd.concat(data_dfs, ignore_index=True) if data_dfs else pd.DataFrame()
+
+        samples = self.samples.sort_values(by="uuid", ascending=True).reset_index(
+            drop=True
         )
 
-        self.samples = self.samples.sort_values(
-            by="subject_id", ascending=True
-        ).reset_index(drop=True)
-
-        if len(self.samples) == 0:
+        if len(samples) == 0:
             raise RuntimeError(
                 f"No files found under {self.img_dir} with {_EXTENSIONS}"
             )
 
-        self.subjects = self.samples["subject_id"].tolist()
-        self.img_paths = self.samples["img_path"].tolist()
-        self.seg_paths = self.samples["seg_path"].tolist()
+        self.records = [
+            Lesion(
+                row.node_id,
+                row.npy_img_path,
+                row.npy_mask_path,
+                (row.centroid_x, row.centroid_y, row.centroid_z),
+            )
+            for row in samples.itertuples(index=False)
+        ]
 
     def __len__(self):
-        return len(self.samples)
+        return len(self.records)
 
     def __getitem__(self, idx: int):
-        img = self._load_file(self.img_paths[idx])
-        seg = self._load_file(self.seg_paths[idx])
+        row = self.records[idx]
+        img = self._load_file(row.npy_img_path)
 
-        # TODO: 3D volume patch containing tumour
-        # TODO: two views from different tumours
-        # - a separate function/class for tumour patch retrieval
-        # - can be adapted for same scan -> multiple tumours
+        patch = centroid_crop(img, (row.centroid[0], row.centroid[1]), self.crop_size)
 
         return (
             torch.stack([self.transform(img) for _ in range(self.V)]),
-            self.subjects[idx],
+            self.records[idx],
         )
 
-    def _load_file(file_path: str):
+    def _load_file(file_path: str) -> np.ndarray:
         img_path = Path(file_path)
-        if img_path.is_file() and img_path.name.endswith("nii.gz"):
-            img = nib.load(img_path)
-            return img.get_fdata()
+        if img_path.is_file():
+            if img_path.name.endswith("npy"):
+                vol_img = np.load(img_path, mmap_mode="r")
+            else:
+                raise RuntimeError(f"Non .npy found calling _load_file: {img_path}")
+            return vol_img
         else:
-            raise RuntimeError(f"Non NIFTI-file found calling _load_file: {img_path}")
+            raise RuntimeError(f"File not found at: {img_path}")
 
     # TODO: replace with grayscale image transformations
     def _transform():
