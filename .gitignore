@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+
+# Hydra
+outputs/
+multirun/
+
+# MLflow
+mlruns/
+
+# Checkpoints / data
+*.ckpt
+*.pt
+*.pth
+*.npy
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*.swo
