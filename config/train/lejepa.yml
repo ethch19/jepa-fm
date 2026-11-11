@@ -1,0 +1,34 @@
+
+output_model_name: lejepa_fm
+
+
+num_workers: 8
+seed: 123
+
+data:
+  rel_path: ../../
+  train:
+    meta_path: data
+    views: 2
+
+param:
+  batch_size: 256
+  img_size: 224
+  emb_dim: 384
+
+loader:
+  persistent_workers: True
+  prefetch_factor: 3
+  pin_memory: True
+
+optimiser:
+  type: AdamW
+  lr: 5e-4
+  weight_decay: 5e-4
+
+loss:
+  sigreg:
+    weight: 0.09
+    kwargs:
+      knots: 17
+      num_proj: 1024

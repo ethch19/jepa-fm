@@ -1,4 +1,5 @@
 import torch
+from pathlib import Path
 from torch.utils.data import DataLoader
 import hydra
 import mlflow
@@ -10,7 +11,11 @@ from jepa_fm.data.utils import SplitType
 from jepa_fm.models.convnextv2 import convnextv2_huge
 
 
-@hydra.main(config_path="conf", config_name="config")
+@hydra.main(
+    version_base=None,
+    config_path=str(Path(__file__).parents[3]) / "config",
+    config_name="train/lejepa",
+)
 def main(cfg: DictConfig) -> None:
     mlflow.set_experiment("LeJEPA LC-FM")
     torch.manual_seed(123)
