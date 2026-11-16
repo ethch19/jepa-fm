@@ -1,5 +1,6 @@
 import math
 import os
+import subprocess
 from datetime import datetime
 from pathlib import Path
 
@@ -213,6 +214,58 @@ def mirror_mlflow_env() -> None:
             os.environ[theirs] = value
 
 
+def git_sha() -> str:
+    """Short sha of the running code, suffixed -dirty outside a clean tree."""
+    try:
+        sha = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=Path(__file__).parents[3],  # hydra may have moved the cwd
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+        dirty = subprocess.check_output(
+            ["git", "status", "--porcelain"],
+            cwd=Path(__file__).parents[3],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError):
+        return "unknown"
+    return f"{sha}-dirty" if dirty else sha
+
+
+class MetricLog:
+    """Buffer step-indexed metrics and push them to MLflow in batches.
+
+    A failed flush keeps the points for the next attempt instead of killing a
+    multi-day run because the tracking box hiccupped.
+    """
+
+    def __init__(self, flush_every: int = 50, max_pending: int = 200):
+        self.flush_every = flush_every
+        self.max_pending = max_pending
+        self.pending: dict[int, dict[str, float]] = {}
+
+    def log(self, metrics: dict[str, float], step: int) -> None:
+        self.pending[step] = metrics
+        if len(self.pending) > self.max_pending:  # tracking server is down
+            for stale in sorted(self.pending)[: len(self.pending) - self.max_pending]:
+                del self.pending[stale]
+        if len(self.pending) >= self.flush_every:
+            self.flush()
+
+    def flush(self) -> None:
+        if not self.pending:
+            return
+        try:
+            for step in sorted(self.pending):
+                mlflow.log_metrics(self.pending[step], step=step)
+        except Exception as exc:  # logging must never be what ends a run
+            print(f"mlflow flush failed, {len(self.pending)} points kept: {exc}")
+            return
+        self.pending.clear()
+
+
 def build_model(
     cfg: DictConfig, device: torch.device
 ) -> tuple[torch.nn.Module, torch.nn.Module]:
@@ -274,6 +327,7 @@ def main(cfg: DictConfig) -> None:
         resolved = OmegaConf.to_container(cfg, resolve=True)
         mlflow.log_params(flatten_config(resolved))
         mlflow.log_param("ckpt_dir", str(run_ckpt_dir))
+        mlflow.log_param("git_sha", git_sha())
         mlflow.log_dict(resolved, "config.yaml")
 
         start_epoch = 0
@@ -292,6 +346,7 @@ def main(cfg: DictConfig) -> None:
 
         step = 0
         saved: list[Path] = []
+        metrics_log = MetricLog()
         for epoch in range(start_epoch, cfg.trainer.epochs):
             net.train()
             projector.train()
@@ -311,7 +366,7 @@ def main(cfg: DictConfig) -> None:
                 progress.set_postfix(**{k: f"{v:.4f}" for k, v in metrics.items()})
 
                 if step % cfg.trainer.log_every == 0:
-                    mlflow.log_metrics(
+                    metrics_log.log(
                         {f"train/{name}": value for name, value in metrics.items()}
                         | {"train/lr": scheduler.get_last_lr()[0]},
                         step=step,
@@ -333,7 +388,7 @@ def main(cfg: DictConfig) -> None:
                         amp_dtype,
                     )
                     sums = {k: sums.get(k, 0.0) + v for k, v in metrics.items()}
-                mlflow.log_metrics(
+                metrics_log.log(
                     {f"val/{name}": total / len(val_loader) for name, total in sums.items()},
                     step=step,
                 )
@@ -351,6 +406,8 @@ def main(cfg: DictConfig) -> None:
                     )
                 )
                 prune_checkpoints(saved, cfg.trainer.keep_last)
+
+        metrics_log.flush()
 
 
 if __name__ == "__main__":
