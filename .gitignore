@@ -1,23 +1,28 @@
-# Python
+ckpt/
+
+# python 
 __pycache__/
 *.py[cod]
 *.egg-info/
 .venv/
 
-# Hydra
+# hydra 
 outputs/
 multirun/
 
-# MLflow
+# mlflow 
 mlruns/
 
-# Checkpoints / data
+# env (see .env.example)
+.env
+
+# data
 *.ckpt
 *.pt
 *.pth
 *.npy
 
-# Editors / OS
+# misc
 .vscode/
 .idea/
 .DS_Store
