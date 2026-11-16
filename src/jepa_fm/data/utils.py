@@ -15,6 +15,25 @@ class VoxelFormat(StrEnum):
     REVERSED = auto()
 
 
+class PairType(StrEnum):
+    ALL = auto()
+    SAME_LESION = auto()
+    DIFF_LESION = auto()
+
+
+class PairOrder(StrEnum):
+    """Whether each pair is produced once or in both directions.
+
+    Only asymmetric terms can tell the difference; a squared distance gives the
+    same value either way. COMBINATION keeps the roles meaningful: pairs are
+    (a, b) with a < b, so with views: 2 the first view is always the context and
+    the second always the target.
+    """
+
+    COMBINATION = auto()  # one pair per pair of images
+    PERMUTATION = auto()  # (a, b) and (b, a)
+
+
 def load_col_file(file_path: Path, cols=None) -> pd.DataFrame:
     match file_path.suffix:
         case ".csv":
