@@ -17,6 +17,9 @@ dependencies = [
     "tqdm>=4.70.1",
 ]
 
+[project.scripts]
+jepa-train = "jepa_fm.pretraining.lejepa:main"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
