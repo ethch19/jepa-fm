@@ -51,6 +51,8 @@ trainer:
   log_every: 50
   ckpt_interval: 5 # in epochs. last epoch always saved
   keep_last: 10 # number of ckpts to keep
+  val_every: 5 # in epochs. last epoch always validated
+  resume_from: null # path to a checkpoint to continue from
 
 loader:
   persistent_workers: true

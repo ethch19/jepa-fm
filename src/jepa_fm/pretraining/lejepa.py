@@ -17,6 +17,20 @@ from jepa_fm.data.utils import SplitType
 AMP_DTYPE = torch.bfloat16
 
 
+def _loader_kwargs(cfg: DictConfig) -> dict:
+    kwargs = dict(
+        batch_size=cfg.trainer.lesions_per_batch,
+        num_workers=cfg.trainer.num_workers,
+        pin_memory=cfg.loader.pin_memory,
+    )
+    if cfg.trainer.num_workers > 0:
+        kwargs |= dict(
+            persistent_workers=cfg.loader.persistent_workers,
+            prefetch_factor=cfg.loader.prefetch_factor,
+        )
+    return kwargs
+
+
 def build_train_loader(cfg: DictConfig) -> DataLoader:
     """A batch is (B, V, D, H, W): B lesions, V random views of each."""
     dataset = PretrainDataset(
@@ -26,19 +40,27 @@ def build_train_loader(cfg: DictConfig) -> DataLoader:
         views=cfg.data.views,
         voxel_format=cfg.data.voxel_format,
     )
+    return DataLoader(dataset, shuffle=True, drop_last=True, **_loader_kwargs(cfg))
 
-    loader_kwargs = dict(
-        batch_size=cfg.trainer.lesions_per_batch,
-        num_workers=cfg.trainer.num_workers,
-        pin_memory=cfg.loader.pin_memory,
+
+def build_val_loader(cfg: DictConfig) -> DataLoader:
+    """Fixed, augmentation-free pass over the val split: (B, V, D, H, W)."""
+    dataset = PretrainDataset(
+        SplitType.VAL,
+        cfg.data.meta_path,
+        cfg.data.crop_size,
+        views=cfg.data.views,
+        inference=True,
+        voxel_format=cfg.data.voxel_format,
     )
-    if cfg.trainer.num_workers > 0:
-        loader_kwargs |= dict(
-            persistent_workers=cfg.loader.persistent_workers,
-            prefetch_factor=cfg.loader.prefetch_factor,
-        )
-
-    return DataLoader(dataset, shuffle=True, drop_last=True, **loader_kwargs)
+    if len(dataset) == 0:
+        raise RuntimeError(f"no {SplitType.VAL} rows under {cfg.data.meta_path}")
+    return DataLoader(
+        dataset,
+        shuffle=False,
+        drop_last=False,
+        **_loader_kwargs(cfg) | {"persistent_workers": False},
+    )
 
 
 def build_lr_scheduler(
@@ -93,6 +115,25 @@ def train_step(
     return {"loss": total.item(), **{name: value.item() for name, value in parts.items()}}
 
 
+@torch.no_grad()
+def eval_step(
+    net: torch.nn.Module,
+    projector: torch.nn.Module,
+    loss_fn: torch.nn.Module,
+    imgs: torch.Tensor,
+    amp_dtype: torch.dtype | None = None,
+) -> dict[str, float]:
+    """Same metrics as train_step, without the optimiser step. Needs .eval() upstream."""
+    with torch.autocast(imgs.device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
+        latents = forward_latents(net, imgs)
+
+    b, v = latents.shape[:2]
+    proj = projector(latents.float().flatten(0, 1)).view(b, v, -1)
+    total, parts = loss_fn(proj)
+
+    return {"loss": total.item(), **{name: value.item() for name, value in parts.items()}}
+
+
 def flatten_config(tree: dict, prefix: str = "") -> dict[str, str | int | float | bool]:
     """Convert config to flat structure scalars"""
     flat: dict[str, str | int | float | bool] = {}
@@ -123,6 +164,7 @@ def save_checkpoint(
     net: torch.nn.Module,
     projector: torch.nn.Module,
     optimiser: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LRScheduler,
     cfg: DictConfig,
 ) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -132,11 +174,29 @@ def save_checkpoint(
             "model": net.state_dict(),
             "projector": projector.state_dict(),
             "optimiser": optimiser.state_dict(),
+            "scheduler": scheduler.state_dict(),
             "config": OmegaConf.to_container(cfg, resolve=True),
         },
         path,
     )
     return path
+
+
+def load_checkpoint(
+    path: Path,
+    net: torch.nn.Module,
+    projector: torch.nn.Module,
+    optimiser: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LRScheduler,
+) -> int:
+    """Restore state in place and return the epoch the checkpoint was written at."""
+    ckpt = torch.load(path, map_location="cpu", weights_only=True)
+    net.load_state_dict(ckpt["model"])
+    projector.load_state_dict(ckpt["projector"])
+    optimiser.load_state_dict(ckpt["optimiser"])
+    if "scheduler" in ckpt:  # checkpoints from before the scheduler was saved
+        scheduler.load_state_dict(ckpt["scheduler"])
+    return ckpt["epoch"]
 
 
 def prune_checkpoints(saved: list[Path], keep: int) -> None:
@@ -151,6 +211,31 @@ def mirror_mlflow_env() -> None:
     ):
         if (value := os.environ.get(ours)) is not None:
             os.environ[theirs] = value
+
+
+def build_model(
+    cfg: DictConfig, device: torch.device
+) -> tuple[torch.nn.Module, torch.nn.Module]:
+    net = instantiate(cfg.model).to(device)
+    projector = instantiate(cfg.projector).to(device)
+    return net, projector
+
+
+def build_optimiser(
+    cfg: DictConfig, params: list[torch.nn.Parameter]
+) -> torch.optim.Optimizer:
+    """Split params so weight decay only reaches matrices and kernels.
+
+    Biases and norm/batch-norm scales are 1-D; decaying them is never wanted.
+    """
+    return instantiate(
+        cfg,
+        _convert_="all",  # plain dicts/lists for torch, not OmegaConf containers
+        params=[
+            {"params": [p for p in params if p.dim() >= 2]},
+            {"params": [p for p in params if p.dim() < 2], "weight_decay": 0.0},
+        ],
+    )
 
 
 @hydra.main(
@@ -169,13 +254,13 @@ def main(cfg: DictConfig) -> None:
     device = torch.device("cuda")
     amp_dtype = AMP_DTYPE
 
-    net = instantiate(cfg.model).to(device)
-    projector = instantiate(cfg.projector).to(device)
+    net, projector = build_model(cfg, device)
     loss_fn = instantiate(cfg.loss).to(device)
-    optimiser = instantiate(
-        cfg.optim, params=[*net.parameters(), *projector.parameters()]
+    optimiser = build_optimiser(
+        cfg.optim, [*net.parameters(), *projector.parameters()]
     )
     train_loader = build_train_loader(cfg)
+    val_loader = build_val_loader(cfg)
     scheduler = build_lr_scheduler(
         optimiser, total_steps=len(train_loader) * cfg.trainer.epochs, **cfg.scheduler
     )
@@ -191,10 +276,25 @@ def main(cfg: DictConfig) -> None:
         mlflow.log_param("ckpt_dir", str(run_ckpt_dir))
         mlflow.log_dict(resolved, "config.yaml")
 
+        start_epoch = 0
+        if cfg.trainer.resume_from:
+            start_epoch = (
+                load_checkpoint(
+                    Path(cfg.trainer.resume_from).expanduser(),
+                    net,
+                    projector,
+                    optimiser,
+                    scheduler,
+                )
+                + 1
+            )
+            mlflow.log_param("resumed_from_epoch", start_epoch - 1)
+
         step = 0
         saved: list[Path] = []
-        for epoch in range(cfg.trainer.epochs):
+        for epoch in range(start_epoch, cfg.trainer.epochs):
             net.train()
+            projector.train()
             progress = tqdm(train_loader, desc=f"epoch {epoch}", unit="batch", leave=False)
 
             for imgs, _lesions in progress:
@@ -217,6 +317,27 @@ def main(cfg: DictConfig) -> None:
                         step=step,
                     )
 
+            if cfg.trainer.val_every > 0 and (
+                (epoch + 1) % cfg.trainer.val_every == 0
+                or epoch == cfg.trainer.epochs - 1
+            ):
+                net.eval()
+                projector.eval()
+                sums: dict[str, float] = {}
+                for imgs, _lesions in val_loader:
+                    metrics = eval_step(
+                        net,
+                        projector,
+                        loss_fn,
+                        imgs.to(device, non_blocking=True),
+                        amp_dtype,
+                    )
+                    sums = {k: sums.get(k, 0.0) + v for k, v in metrics.items()}
+                mlflow.log_metrics(
+                    {f"val/{name}": total / len(val_loader) for name, total in sums.items()},
+                    step=step,
+                )
+
             if epoch == cfg.trainer.epochs - 1 or (epoch + 1) % cfg.trainer.ckpt_interval == 0:
                 saved.append(
                     save_checkpoint(
@@ -225,6 +346,7 @@ def main(cfg: DictConfig) -> None:
                         net,
                         projector,
                         optimiser,
+                        scheduler,
                         cfg,
                     )
                 )
