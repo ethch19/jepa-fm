@@ -101,7 +101,7 @@ class PretrainDataset(Dataset):
 
         samples = pd.concat(data_dfs, ignore_index=True) if data_dfs else pd.DataFrame()
 
-        if not samples:
+        if samples.empty:
             raise RuntimeError(
                 f"No files found under {self.meta_dir} with {_EXTENSIONS}"
             )
