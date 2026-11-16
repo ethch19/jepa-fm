@@ -6,8 +6,8 @@ import torch.nn.functional as F
 class LayerNorm(nn.Module):
     """LayerNorm that supports two data formats: channels_last (default) or channels_first.
     The ordering of the dimensions in the inputs. channels_last corresponds to inputs with
-    shape (batch_size, height, width, channels) while channels_first corresponds to inputs
-    with shape (batch_size, channels, height, width).
+    shape (batch_size, depth, height, width, channels) while channels_first corresponds to
+    inputs with shape (batch_size, channels, depth, height, width).
     """
 
     def __init__(self, normalized_shape, eps=1e-6, data_format="channels_last"):
@@ -29,19 +29,26 @@ class LayerNorm(nn.Module):
             u = x.mean(1, keepdim=True)
             s = (x - u).pow(2).mean(1, keepdim=True)
             x = (x - u) / torch.sqrt(s + self.eps)
-            x = self.weight[:, None, None] * x + self.bias[:, None, None]
+            x = self.weight[:, None, None, None] * x + self.bias[:, None, None, None]
             return x
 
 
 class GRN(nn.Module):
-    """GRN (Global Response Normalization) layer"""
+    """GRN (Global Response Normalization) layer for (N, D, H, W, C) volumes.
 
-    def __init__(self, dim):
+    Normalised over channel mean instead of sum over channels
+    """
+
+    def __init__(self, dim, eps=1e-6):
         super().__init__()
-        self.gamma = nn.Parameter(torch.zeros(1, 1, 1, dim))
-        self.beta = nn.Parameter(torch.zeros(1, 1, 1, dim))
+        self.gamma = nn.Parameter(torch.zeros(1, 1, 1, 1, dim))
+        self.beta = nn.Parameter(torch.zeros(1, 1, 1, 1, dim))
+        self.eps = eps
 
     def forward(self, x):
-        Gx = torch.norm(x, p=2, dim=(1, 2), keepdim=True)
-        Nx = Gx / (Gx.mean(dim=-1, keepdim=True) + 1e-6)
-        return self.gamma * (x * Nx) + self.beta + x
+        dtype = x.dtype
+        gx = torch.linalg.vector_norm(
+            x, ord=2, dim=(1, 2, 3), keepdim=True, dtype=torch.float32
+        )
+        nx = (gx / (gx.mean(dim=-1, keepdim=True) + self.eps)).to(dtype)
+        return self.gamma * (x * nx) + self.beta + x
