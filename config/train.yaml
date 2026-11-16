@@ -1,0 +1,58 @@
+defaults:
+  - model: convnextv2_huge
+  - _self_
+  - experiment: null
+
+run_name: lejepa
+seed: 123
+
+model:
+  drop_path_rate: 0.05 # ramped linearly from 0 to specified rate, runs every forward pass
+
+data:
+  meta_path: data # directory containing parquet/csv files
+  voxel_format: reversed
+  crop_size: [128, 128, 128]
+  views: 2
+
+optim:
+  _target_: torch.optim.AdamW
+  lr: 5.0e-4
+  weight_decay: 5.0e-4
+
+scheduler: # stepped once per optimiser step
+  warmup_steps: 500
+  min_lr_ratio: 1.0e-3 # final lr, as a fraction of optim.lr
+
+projector: # only feeds the loss terms; probing uses the encoder latents
+  _target_: jepa_fm.models.projector.Projector
+  in_dim: 768 # convnextv2_huge stage 4 width
+  hidden_dim: 2048
+  out_dim: 768 # le-wm keeps the input width; lower it to bottle the loss space
+
+loss:
+  _target_: jepa_fm.losses.CompositeLoss
+  _recursive_: true
+  terms:
+    mse:
+      _target_: jepa_fm.losses.LatentMSE
+      pairs: same_lesion # all, same_lesion, diff_lesion
+      order: combination # combination, permutation
+    sigreg: # applies to all
+      _target_: jepa_fm.losses.SIGReg
+      weight: 0.09
+      knots: 17
+      num_proj: 256
+
+trainer:
+  lesions_per_batch: 4
+  num_workers: 8
+  epochs: 100
+  log_every: 50
+  ckpt_interval: 5 # in epochs. last epoch always saved
+  keep_last: 10 # number of ckpts to keep
+
+loader:
+  persistent_workers: true
+  prefetch_factor: 3
+  pin_memory: true
