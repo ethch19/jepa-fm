@@ -19,6 +19,7 @@ from jepa_fm.data.utils import SplitType
 from jepa_fm.models.utils import forward_latents
 from jepa_fm.probe import EmbeddingMetric
 from jepa_fm.probe.extract import extract_embeddings, group_rows
+from jepa_fm.utils import MetricLog, log_metric_figures
 
 AMP_DTYPE = torch.bfloat16
 
@@ -70,11 +71,6 @@ def build_val_loader(cfg: DictConfig) -> DataLoader:
 
 
 def build_probe_loader(cfg: DictConfig) -> DataLoader:
-    """Fixed, augmentation-free subset of the train split: (B, 1, D, H, W).
-
-    Train rather than val keeps RankMe's ceiling away from the val set size; a
-    seeded subset makes checkpoints of one run directly comparable.
-    """
     dataset = PretrainDataset(
         SplitType.TRAIN,
         cfg.data.meta_path,
@@ -147,7 +143,6 @@ def eval_step(
     imgs: torch.Tensor,
     amp_dtype: torch.dtype | None = None,
 ) -> dict[str, float]:
-    """Same metrics as train_step, without the optimiser step. Needs .eval() upstream."""
     with torch.autocast(imgs.device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
         latents = forward_latents(net, imgs)
 
@@ -213,12 +208,11 @@ def load_checkpoint(
     optimiser: torch.optim.Optimizer,
     scheduler: torch.optim.lr_scheduler.LRScheduler,
 ) -> int:
-    """Restore state in place and return the epoch the checkpoint was written at."""
     ckpt = torch.load(path, map_location="cpu", weights_only=True)
     net.load_state_dict(ckpt["model"])
     projector.load_state_dict(ckpt["projector"])
     optimiser.load_state_dict(ckpt["optimiser"])
-    if "scheduler" in ckpt:  # checkpoints from before the scheduler was saved
+    if "scheduler" in ckpt:
         scheduler.load_state_dict(ckpt["scheduler"])
     return ckpt["epoch"]
 
@@ -242,7 +236,7 @@ def git_sha() -> str:
     try:
         sha = subprocess.check_output(
             ["git", "rev-parse", "--short", "HEAD"],
-            cwd=Path(__file__).parents[3],  # hydra may have moved the cwd
+            cwd=Path(__file__).parents[3],
             text=True,
             stderr=subprocess.DEVNULL,
         ).strip()
@@ -257,38 +251,6 @@ def git_sha() -> str:
     return f"{sha}-dirty" if dirty else sha
 
 
-class MetricLog:
-    """Buffer step-indexed metrics and push them to MLflow in batches.
-
-    A failed flush keeps the points for the next attempt instead of killing a
-    multi-day run because the tracking box hiccupped.
-    """
-
-    def __init__(self, flush_every: int = 50, max_pending: int = 200):
-        self.flush_every = flush_every
-        self.max_pending = max_pending
-        self.pending: dict[int, dict[str, float]] = {}
-
-    def log(self, metrics: dict[str, float], step: int) -> None:
-        self.pending[step] = metrics
-        if len(self.pending) > self.max_pending:  # tracking server is down
-            for stale in sorted(self.pending)[: len(self.pending) - self.max_pending]:
-                del self.pending[stale]
-        if len(self.pending) >= self.flush_every:
-            self.flush()
-
-    def flush(self) -> None:
-        if not self.pending:
-            return
-        try:
-            for step in sorted(self.pending):
-                mlflow.log_metrics(self.pending[step], step=step)
-        except Exception as exc:  # logging must never be what ends a run
-            print(f"mlflow flush failed, {len(self.pending)} points kept: {exc}")
-            return
-        self.pending.clear()
-
-
 def build_model(
     cfg: DictConfig, device: torch.device
 ) -> tuple[torch.nn.Module, torch.nn.Module]:
@@ -300,13 +262,10 @@ def build_model(
 def build_optimiser(
     cfg: DictConfig, params: list[torch.nn.Parameter]
 ) -> torch.optim.Optimizer:
-    """Split params so weight decay only reaches matrices and kernels.
-
-    Biases and norm/batch-norm scales are 1-D; decaying them is never wanted.
-    """
+    """Split params so weight decay only reaches matrices and kernels."""
     return instantiate(
         cfg,
-        _convert_="all",  # plain dicts/lists for torch, not OmegaConf containers
+        _convert_="all",
         params=[
             {"params": [p for p in params if p.dim() >= 2]},
             {"params": [p for p in params if p.dim() < 2], "weight_decay": 0.0},
@@ -324,7 +283,6 @@ def run_probe(
     epoch: int,
     epoch_log: MetricLog,
 ) -> None:
-    """Score the frozen encoder on the probe set and log against the epoch."""
     started = time.perf_counter()
     embeddings, labels = extract_embeddings(
         net, projector, loader, cfg.probe.spaces, device, AMP_DTYPE
@@ -337,7 +295,7 @@ def run_probe(
         for group, rows in group_rows(labels, cfg.probe.group_by).items():
             idx = torch.as_tensor(rows)
             if len(idx) < 4 * z.shape[1]:
-                # a rank cannot exceed the row count, so this group is not comparable
+                # a rank cannot exceed the row count
                 print(
                     f"probe: {space}/{group} has {len(idx)} rows, "
                     f"rankme saturates near {len(idx)}"
@@ -362,13 +320,9 @@ def run_probe(
     config_name="train",
 )
 def main(cfg: DictConfig) -> None:
-    # real environment variables win; a missing .env is not an error
     load_dotenv(Path(__file__).parents[3] / ".env")
     if not torch.cuda.is_available():
-        raise RuntimeError(
-            "No CUDA device available; pretraining runs on GPU only "
-            "(check the driver and CUDA_VISIBLE_DEVICES)."
-        )
+        raise RuntimeError("No CUDA device available")
 
     torch.manual_seed(cfg.seed)
     device = torch.device("cuda")
@@ -417,7 +371,6 @@ def main(cfg: DictConfig) -> None:
         n_ckpt = 0
         saved: list[Path] = []
         metrics_log = MetricLog()
-        # probe metrics are indexed by epoch, and must not share this buffer's steps
         epoch_log = MetricLog()
         for epoch in range(start_epoch, cfg.trainer.epochs):
             net.train()
@@ -493,6 +446,10 @@ def main(cfg: DictConfig) -> None:
 
         metrics_log.flush()
         epoch_log.flush()
+        try:
+            log_metric_figures({**metrics_log.history, **epoch_log.history})
+        except Exception as exc:  # a missing figure must not fail a finished run
+            print(f"metric figures failed: {exc}")
 
 
 if __name__ == "__main__":

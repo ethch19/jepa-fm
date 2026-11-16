@@ -1,9 +1,3 @@
-"""Model in, (N, D) embedding matrices out, plus the row labels the metrics need.
-
-Shared by the online path (a probe during training) and the offline path (from a
-checkpoint), so the numbers stay comparable between the two.
-"""
-
 from collections.abc import Sequence
 
 import torch
@@ -22,11 +16,6 @@ def extract_embeddings(
     device: torch.device,
     amp_dtype: torch.dtype | None = None,
 ) -> tuple[dict[str, Tensor], list[str]]:
-    """One pass over `loader`: a float32 CPU (N, D) matrix per space, plus row labels.
-
-    The loader must yield single views (`views=1`): the same lesion twice would
-    silently weigh its directions twice in the spectrum.
-    """
     net.eval()
     projector.eval()
     latents: list[Tensor] = []
@@ -52,7 +41,6 @@ def extract_embeddings(
 
 
 def group_rows(labels: Sequence[str], group_by: str | None) -> dict[str, list[int]]:
-    """Row indices per group: one 'all' group, or one group per metadata file."""
     if group_by in (None, "all"):
         return {"all": list(range(len(labels)))}
     if group_by != "dataset":
