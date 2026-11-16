@@ -44,6 +44,17 @@ loss:
       knots: 17
       num_proj: 256
 
+probe: # label-free metrics on the frozen encoder, logged against epochs
+  _recursive_: true
+  spaces: [enc] # enc, proj -- proj is the space the loss actually sees
+  samples: 25600 # seeded subset of train rows; null for all of them
+  every_n_ckpt: 1 # probe on every Nth checkpoint that gets written
+  group_by: null # null (one 'all' group) or dataset (one group per metadata file)
+  metrics:
+    rankme:
+      _target_: jepa_fm.probe.RankMe
+      eps: 1.0e-7
+
 trainer:
   lesions_per_batch: 4
   num_workers: 8

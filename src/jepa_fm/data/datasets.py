@@ -23,6 +23,7 @@ class Lesion(NamedTuple):
     npy_img_path: str
     npy_mask_path: str
     centroid: tuple[float, float, float]  # stored dependining on voxel_format
+    dataset: str  # stem of the metadata file this row came from
 
 
 class PretrainDataset(Dataset):
@@ -96,7 +97,9 @@ class PretrainDataset(Dataset):
                     print(f"{file}: dropped {(~npy_only).sum()} rows")
 
                 data_dfs.append(
-                    tabular.loc[npy_only & (tabular["cohort"] == self.split)]
+                    tabular.loc[npy_only & (tabular["cohort"] == self.split)].assign(
+                        dataset=file.stem
+                    )
                 )
 
         samples = pd.concat(data_dfs, ignore_index=True) if data_dfs else pd.DataFrame()
@@ -118,6 +121,7 @@ class PretrainDataset(Dataset):
                         row.npy_img_path,
                         row.npy_seg_path,
                         (row.centroid_x, row.centroid_y, row.centroid_z),
+                        row.dataset,
                     )
                     for row in samples.itertuples(index=False)
                 ]
@@ -128,6 +132,7 @@ class PretrainDataset(Dataset):
                         row.npy_img_path,
                         row.npy_seg_path,
                         (row.centroid_z, row.centroid_y, row.centroid_x),
+                        row.dataset,
                     )
                     for row in samples.itertuples(index=False)
                 ]
@@ -140,7 +145,11 @@ class PretrainDataset(Dataset):
         return len(self.records)
 
     def __getitem__(self, idx: int):
-        """Returns (V, D, H, W) where views are extracted from the same centroid crop, just different transformations"""
+        """Returns (V, D, H, W) where views are extracted from the same centroid crop, just different transformations
+
+        plus the lesion and dataset this row belongs to, as plain strings so the
+        default collate hands them back as a list rather than mangling a pandas row.
+        """
         row = self.records[idx]
         img = load_file(row.npy_img_path)
 
@@ -148,5 +157,6 @@ class PretrainDataset(Dataset):
 
         return (
             torch.stack([self.transform(patch) for _ in range(self.views)]),
-            row,
+            row.uuid,
+            row.dataset,
         )

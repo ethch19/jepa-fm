@@ -52,3 +52,13 @@ class GRN(nn.Module):
         )
         nx = (gx / (gx.mean(dim=-1, keepdim=True) + self.eps)).to(dtype)
         return self.gamma * (x * nx) + self.beta + x
+
+
+def forward_latents(net: nn.Module, imgs: torch.Tensor) -> torch.Tensor:
+    """(B, V, D, H, W) volumes -> (B, V, C) latents.
+
+    One encoder pass over all B * V volumes, then global average pooling for each view
+    """
+    b, v = imgs.shape[:2]
+    features = net(imgs.flatten(0, 1).unsqueeze(1))  # (B*V, C, d, h, w)
+    return features.mean(dim=(2, 3, 4)).view(b, v, -1)

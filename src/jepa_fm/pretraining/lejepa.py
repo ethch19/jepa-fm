@@ -1,6 +1,7 @@
 import math
 import os
 import subprocess
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -10,11 +11,14 @@ import torch
 from dotenv import load_dotenv
 from hydra.utils import instantiate
 from omegaconf import DictConfig, OmegaConf
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
 from jepa_fm.data.datasets import PretrainDataset
 from jepa_fm.data.utils import SplitType
+from jepa_fm.models.utils import forward_latents
+from jepa_fm.probe import EmbeddingMetric
+from jepa_fm.probe.extract import extract_embeddings, group_rows
 
 AMP_DTYPE = torch.bfloat16
 
@@ -65,6 +69,34 @@ def build_val_loader(cfg: DictConfig) -> DataLoader:
     )
 
 
+def build_probe_loader(cfg: DictConfig) -> DataLoader:
+    """Fixed, augmentation-free subset of the train split: (B, 1, D, H, W).
+
+    Train rather than val keeps RankMe's ceiling away from the val set size; a
+    seeded subset makes checkpoints of one run directly comparable.
+    """
+    dataset = PretrainDataset(
+        SplitType.TRAIN,
+        cfg.data.meta_path,
+        cfg.data.crop_size,
+        views=1,
+        inference=True,
+        voxel_format=cfg.data.voxel_format,
+    )
+    size = len(dataset)
+    if cfg.probe.samples is not None:
+        size = min(cfg.probe.samples, size)
+    indices = torch.randperm(
+        len(dataset), generator=torch.Generator().manual_seed(cfg.seed)
+    )[:size].tolist()
+    return DataLoader(
+        Subset(dataset, indices),
+        shuffle=False,
+        drop_last=False,
+        **_loader_kwargs(cfg) | {"persistent_workers": False},
+    )
+
+
 def build_lr_scheduler(
     optimiser: torch.optim.Optimizer,
     total_steps: int,
@@ -83,16 +115,6 @@ def build_lr_scheduler(
         return min_lr_ratio + (1 - min_lr_ratio) * 0.5 * (1 + math.cos(math.pi * progress))
 
     return torch.optim.lr_scheduler.LambdaLR(optimiser, factor)
-
-
-def forward_latents(net: torch.nn.Module, imgs: torch.Tensor) -> torch.Tensor:
-    """(B, V, D, H, W) volumes -> (B, V, C) latents.
-
-    One encoder pass over all B * V volumes, then global average pooling for each view
-    """
-    b, v = imgs.shape[:2]
-    features = net(imgs.flatten(0, 1).unsqueeze(1))  # (B*V, C, d, h, w)
-    return features.mean(dim=(2, 3, 4)).view(b, v, -1)
 
 
 def train_step(
@@ -292,6 +314,48 @@ def build_optimiser(
     )
 
 
+def run_probe(
+    net: torch.nn.Module,
+    projector: torch.nn.Module,
+    metrics: dict[str, EmbeddingMetric],
+    loader: DataLoader,
+    cfg: DictConfig,
+    device: torch.device,
+    epoch: int,
+    epoch_log: MetricLog,
+) -> None:
+    """Score the frozen encoder on the probe set and log against the epoch."""
+    started = time.perf_counter()
+    embeddings, labels = extract_embeddings(
+        net, projector, loader, cfg.probe.spaces, device, AMP_DTYPE
+    )
+    values: dict[str, float] = {
+        "probe/d": float(next(iter(embeddings.values())).shape[1])
+    }
+
+    for space, z in embeddings.items():
+        for group, rows in group_rows(labels, cfg.probe.group_by).items():
+            idx = torch.as_tensor(rows)
+            if len(idx) < 4 * z.shape[1]:
+                # a rank cannot exceed the row count, so this group is not comparable
+                print(
+                    f"probe: {space}/{group} has {len(idx)} rows, "
+                    f"rankme saturates near {len(idx)}"
+                )
+            for name, metric in metrics.items():
+                values |= {
+                    f"probe/{space}/{group}/{name}/{key}": value
+                    for key, value in metric(z[idx]).items()
+                }
+
+    values |= {
+        "probe/n": float(len(labels)),
+        "probe/seconds": time.perf_counter() - started,
+    }
+    epoch_log.log(values, step=epoch)
+    epoch_log.flush()
+
+
 @hydra.main(
     version_base=None,
     config_path=str(Path(__file__).parents[3] / "config"),
@@ -317,6 +381,8 @@ def main(cfg: DictConfig) -> None:
     )
     train_loader = build_train_loader(cfg)
     val_loader = build_val_loader(cfg)
+    probe_loader = build_probe_loader(cfg)
+    probe_metrics = instantiate(cfg.probe.metrics)
     scheduler = build_lr_scheduler(
         optimiser, total_steps=len(train_loader) * cfg.trainer.epochs, **cfg.scheduler
     )
@@ -348,14 +414,17 @@ def main(cfg: DictConfig) -> None:
             mlflow.log_param("resumed_from_epoch", start_epoch - 1)
 
         step = 0
+        n_ckpt = 0
         saved: list[Path] = []
         metrics_log = MetricLog()
+        # probe metrics are indexed by epoch, and must not share this buffer's steps
+        epoch_log = MetricLog()
         for epoch in range(start_epoch, cfg.trainer.epochs):
             net.train()
             projector.train()
             progress = tqdm(train_loader, desc=f"epoch {epoch}", unit="batch", leave=False)
 
-            for imgs, _lesions in progress:
+            for imgs, _, _ in progress:
                 metrics = train_step(
                     net,
                     projector,
@@ -375,14 +444,14 @@ def main(cfg: DictConfig) -> None:
                         step=step,
                     )
 
+            is_last = epoch == cfg.trainer.epochs - 1
             if cfg.trainer.val_every > 0 and (
-                (epoch + 1) % cfg.trainer.val_every == 0
-                or epoch == cfg.trainer.epochs - 1
+                is_last or (epoch + 1) % cfg.trainer.val_every == 0
             ):
                 net.eval()
                 projector.eval()
                 sums: dict[str, float] = {}
-                for imgs, _lesions in val_loader:
+                for imgs, _, _ in val_loader:
                     metrics = eval_step(
                         net,
                         projector,
@@ -396,7 +465,7 @@ def main(cfg: DictConfig) -> None:
                     step=step,
                 )
 
-            if epoch == cfg.trainer.epochs - 1 or (epoch + 1) % cfg.trainer.ckpt_interval == 0:
+            if is_last or (epoch + 1) % cfg.trainer.ckpt_interval == 0:
                 saved.append(
                     save_checkpoint(
                         run_ckpt_dir / f"epoch_{epoch:04d}.pt",
@@ -409,8 +478,21 @@ def main(cfg: DictConfig) -> None:
                     )
                 )
                 prune_checkpoints(saved, cfg.trainer.keep_last)
+                if n_ckpt % cfg.probe.every_n_ckpt == 0 or is_last:
+                    run_probe(
+                        net,
+                        projector,
+                        probe_metrics,
+                        probe_loader,
+                        cfg,
+                        device,
+                        epoch,
+                        epoch_log,
+                    )
+                n_ckpt += 1
 
         metrics_log.flush()
+        epoch_log.flush()
 
 
 if __name__ == "__main__":
