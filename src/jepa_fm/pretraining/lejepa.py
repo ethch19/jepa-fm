@@ -1,3 +1,4 @@
+import itertools
 import math
 import os
 import subprocess
@@ -51,7 +52,6 @@ def build_train_loader(cfg: DictConfig) -> DataLoader:
 
 
 def build_val_loader(cfg: DictConfig) -> DataLoader:
-    """Fixed, augmentation-free pass over the val split: (B, V, D, H, W)."""
     dataset = PretrainDataset(
         SplitType.VAL,
         cfg.data.meta_path,
@@ -120,6 +120,7 @@ def train_step(
     loss_fn: torch.nn.Module,
     imgs: torch.Tensor,
     amp_dtype: torch.dtype | None = None,
+    max_grad_norm: float | None = None,
 ) -> dict[str, float]:
     with torch.autocast(imgs.device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
         latents = forward_latents(net, imgs)
@@ -130,9 +131,27 @@ def train_step(
 
     optimiser.zero_grad(set_to_none=True)
     total.backward()
+
+    params = [
+        p for p in itertools.chain(net.parameters(), projector.parameters()) if p.grad is not None
+    ]
+    if max_grad_norm:
+        # returns the pre-clipping norm, which is the number worth watching
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            params, max_grad_norm, error_if_nonfinite=False
+        )
+    else:
+        grad_norm = torch.linalg.vector_norm(
+            torch.stack([torch.linalg.vector_norm(p.grad) for p in params])
+        )
     optimiser.step()
 
-    return {"loss": total.item(), **{name: value.item() for name, value in parts.items()}}
+    metrics: dict[str, float] = {
+        "loss": total.item(),
+        "grad_norm": float(grad_norm),
+    }
+    metrics |= {name: value.item() for name, value in parts.items()}
+    return metrics
 
 
 @torch.no_grad()
@@ -167,14 +186,14 @@ def flatten_config(tree: dict, prefix: str = "") -> dict[str, str | int | float 
     return flat
 
 
-def checkpoint_dir(run_name: str) -> Path:
+def checkpoint_dir(run_name: str, run_id: str) -> Path:
     root = os.environ.get("CKPT_DIR")
     if not root:
         raise RuntimeError(
             "CKPT_DIR is not set. Point it at the checkpoint disk in .env"
         )
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    return Path(root).expanduser() / f"{run_name}_{stamp}"
+    return Path(root).expanduser() / f"{run_name}_{stamp}_{run_id}"
 
 
 def save_checkpoint(
@@ -232,7 +251,7 @@ def mirror_mlflow_env() -> None:
 
 
 def git_sha() -> str:
-    """Short sha of the running code, suffixed -dirty outside a clean tree."""
+    """Short sha of the running code"""
     try:
         sha = subprocess.check_output(
             ["git", "rev-parse", "--short", "HEAD"],
@@ -262,7 +281,6 @@ def build_model(
 def build_optimiser(
     cfg: DictConfig, params: list[torch.nn.Parameter]
 ) -> torch.optim.Optimizer:
-    """Split params so weight decay only reaches matrices and kernels."""
     return instantiate(
         cfg,
         _convert_="all",
@@ -340,13 +358,12 @@ def main(cfg: DictConfig) -> None:
     scheduler = build_lr_scheduler(
         optimiser, total_steps=len(train_loader) * cfg.trainer.epochs, **cfg.scheduler
     )
-    run_ckpt_dir = checkpoint_dir(cfg.run_name)
-
     mirror_mlflow_env()
     mlflow.set_tracking_uri(os.environ.get("MLFLOW_TRACKING_URI", "mlruns"))
     mlflow.set_experiment(os.environ.get("MLFLOW_EXPERIMENT_NAME", "jepa-fm-pretrain"))
 
-    with mlflow.start_run(run_name=cfg.run_name):
+    with mlflow.start_run(run_name=cfg.run_name) as run:
+        run_ckpt_dir = checkpoint_dir(cfg.run_name, run.info.run_id)
         resolved = OmegaConf.to_container(cfg, resolve=True)
         mlflow.log_params(flatten_config(resolved))
         mlflow.log_param("ckpt_dir", str(run_ckpt_dir))
@@ -385,6 +402,7 @@ def main(cfg: DictConfig) -> None:
                     loss_fn,
                     imgs.to(device, non_blocking=True),
                     amp_dtype,
+                    cfg.trainer.max_grad_norm,
                 )
                 step += 1
                 scheduler.step()
@@ -448,7 +466,7 @@ def main(cfg: DictConfig) -> None:
         epoch_log.flush()
         try:
             log_metric_figures({**metrics_log.history, **epoch_log.history})
-        except Exception as exc:  # a missing figure must not fail a finished run
+        except Exception as exc:
             print(f"metric figures failed: {exc}")
 
 

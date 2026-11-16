@@ -54,12 +54,21 @@ probe: # label-free metrics on the frozen encoder, logged against epochs
     rankme:
       _target_: jepa_fm.probe.RankMe
       eps: 1.0e-7
+    uniform:
+      _target_: jepa_fm.probe.Uniformity
+      num_pairs: 8192
+      seed: 0
+    variance:
+      _target_: jepa_fm.probe.PerDimVariance
+      top_k: 64
+      dead_std: 1.0e-3
 
 trainer:
   lesions_per_batch: 4
   num_workers: 8
   epochs: 100
   log_every: 50
+  max_grad_norm: 1.0 # global grad norm clip; null to only log the norm
   ckpt_interval: 5 # in epochs. last epoch always saved
   keep_last: 10 # number of ckpts to keep
   val_every: 5 # in epochs. last epoch always validated

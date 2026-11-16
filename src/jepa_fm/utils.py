@@ -4,11 +4,6 @@ import mlflow
 
 
 class MetricLog:
-    """Buffer step-indexed metrics and push them to MLflow in batches.
-
-    Every point is also kept in `history`, which the end-of-run figures use.
-    """
-
     def __init__(self, flush_every: int = 50, max_pending: int = 200):
         self.flush_every = flush_every
         self.max_pending = max_pending
@@ -38,11 +33,10 @@ class MetricLog:
 
 
 def log_metric_figures(history: dict[str, dict[int, float]]) -> list[str]:
-    """Draw one PNG per metric prefix (train/, val/, probe/) as a run artifact."""
     try:
         import matplotlib
 
-        matplotlib.use("Agg")  # no display on the training box
+        matplotlib.use("Agg")
         import matplotlib.pyplot as plt
     except ImportError:
         print("matplotlib is not installed, skipping metric figures")
@@ -55,7 +49,6 @@ def log_metric_figures(history: dict[str, dict[int, float]]) -> list[str]:
 
     logged: list[str] = []
     for group, series in sorted(groups.items()):
-        # a subplot per metric: loss and a learning rate cannot share a y axis
         rows = math.ceil(len(series) / 2)
         fig, axes = plt.subplots(rows, 2, figsize=(10, 2.8 * rows), squeeze=False)
         for ax, (name, points) in zip(axes.flat, sorted(series.items())):
