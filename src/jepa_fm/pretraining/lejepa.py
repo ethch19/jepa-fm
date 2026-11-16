@@ -7,6 +7,7 @@ from pathlib import Path
 import hydra
 import mlflow
 import torch
+from dotenv import load_dotenv
 from hydra.utils import instantiate
 from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader
@@ -297,6 +298,8 @@ def build_optimiser(
     config_name="train",
 )
 def main(cfg: DictConfig) -> None:
+    # real environment variables win; a missing .env is not an error
+    load_dotenv(Path(__file__).parents[3] / ".env")
     if not torch.cuda.is_available():
         raise RuntimeError(
             "No CUDA device available; pretraining runs on GPU only "
