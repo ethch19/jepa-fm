@@ -22,6 +22,7 @@ dependencies = [
 
 [project.scripts]
 jepa-train = "jepa_fm.pretraining.lejepa:main"
+jepa-eval = "jepa_fm.evals.extract:main"
 
 [build-system]
 requires = ["hatchling"]

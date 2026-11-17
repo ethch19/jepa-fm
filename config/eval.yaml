@@ -1,0 +1,31 @@
+defaults:
+  - _self_
+
+ckpt: /path/to/checkpoint.pt # explicit; no run-id resolution
+meta_path: data # directory searched for <name>.csv|parquet
+cache_dir: null # null -> $CKPT_DIR/embeddings
+force: false # ignore a matching cache entry
+
+datasets: []
+# Every cohort is extracted, whatever its role. crop_size and voxel_format are
+# not set here: they come from the checkpoint's own saved config.
+#   - name: lidc                  # also the cache file name
+#     role: train                 # train | test -- recorded, not acted on
+#     meta_file: data/lidc.parquet # optional; defaults to <meta_path>/<name>.{parquet,csv}
+#     endpoint:
+#       kind: binary              # binary | survival
+#       label_column: malignant   # binary labels must already be 0/1
+#
+#   - name: nlst
+#     role: test
+#     endpoint:
+#       kind: survival
+#       label_column: survival_months # only checked to be numeric; stage 2 interprets it
+
+device: cuda
+amp: bf16 # null disables autocast (CPU tests)
+batch_size: 8
+num_workers: 8
+
+mlflow:
+  experiment: jepa-fm-eval

@@ -13,6 +13,9 @@ multirun/
 # mlflow 
 mlruns/
 
+# planning docs (specs/plans stay local)
+docs/
+
 # env (see .env.example)
 .env
 
