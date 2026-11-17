@@ -42,12 +42,12 @@ loss:
       _target_: jepa_fm.losses.SIGReg
       weight: 0.09
       knots: 17
-      num_proj: 256
+      num_proj: 1024
 
 probe: # label-free metrics on the frozen encoder, logged against epochs
   _recursive_: true
   spaces: [enc] # enc, proj -- proj is the space the loss actually sees
-  samples: 25600 # seeded subset of train rows; null for all of them
+  samples: 1024 # seeded subset of train rows; null for all of them
   every_n_ckpt: 1 # probe on every Nth checkpoint that gets written
   group_by: null # null (one 'all' group) or dataset (one group per metadata file)
   metrics:

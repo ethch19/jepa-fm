@@ -394,7 +394,7 @@ def main(cfg: DictConfig) -> None:
             projector.train()
             progress = tqdm(train_loader, desc=f"epoch {epoch}", unit="batch", leave=False)
 
-            for imgs, _, _ in progress:
+            for imgs, _, _, _ in progress:
                 metrics = train_step(
                     net,
                     projector,
@@ -422,7 +422,7 @@ def main(cfg: DictConfig) -> None:
                 net.eval()
                 projector.eval()
                 sums: dict[str, float] = {}
-                for imgs, _, _ in val_loader:
+                for imgs, _, _, _ in val_loader:
                     metrics = eval_step(
                         net,
                         projector,

@@ -20,7 +20,7 @@ def extract_embeddings(
     projector.eval()
     latents: list[Tensor] = []
     labels: list[str] = []
-    for imgs, _, dataset in loader:
+    for imgs, _, dataset, _ in loader:
         with torch.autocast(device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
             latents.append(
                 forward_latents(net, imgs.to(device, non_blocking=True))[:, 0]

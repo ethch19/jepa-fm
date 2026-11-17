@@ -1,11 +1,13 @@
 import pandas as pd
 from pathlib import Path
+import numpy as np
 import torch
 from torch.utils.data import Dataset
 from torchvision.transforms import v2
 from typing import NamedTuple
 import monai.transforms as mai_tf
 
+from jepa_fm.data.radiomics import RadiomicsExtractor
 from jepa_fm.data.utils import (
     VoxelFormat,
     SplitType,
@@ -57,10 +59,12 @@ class PretrainDataset(Dataset):
         views: int = 1,
         inference: bool = False,
         voxel_format: VoxelFormat = VoxelFormat.REVERSED,
+        radiomics: bool = True,
     ):
         self.split = split
         self.meta_dir = Path(meta_dir)
         self.views = views
+        self.radiomics = RadiomicsExtractor() if radiomics and views > 1 else None
         self.crop_size = tuple(int(round(s)) for s in crop_size)
         self.voxel_format = (
             VoxelFormat[voxel_format.upper()]
@@ -148,15 +152,21 @@ class PretrainDataset(Dataset):
         """Returns (V, D, H, W) where views are extracted from the same centroid crop, just different transformations
 
         plus the lesion and dataset this row belongs to, as plain strings so the
-        default collate hands them back as a list rather than mangling a pandas row.
+        default collate hands them back as a list rather than mangling a pandas row,
+        plus the signed radiomics difference between view 0 and every other view
+        as (V - 1, F).
         """
         row = self.records[idx]
         img = load_file(row.npy_img_path)
 
         patch = centroid_crop(img, row.centroid, self.crop_size)
 
-        return (
-            torch.stack([self.transform(patch) for _ in range(self.views)]),
-            row.uuid,
-            row.dataset,
-        )
+        views = [self.transform(patch) for _ in range(self.views)]
+
+        if self.radiomics is None:
+            delta = torch.zeros(0)
+        else:
+            features = np.stack([self.radiomics(view) for view in views])
+            delta = torch.from_numpy(features[1:] - features[0])
+
+        return torch.stack(views), row.uuid, row.dataset, delta
