@@ -10,9 +10,9 @@ model:
   drop_path_rate: 0.05 # ramped linearly from 0 to specified rate, runs every forward pass
 
 data:
-  meta_path: data # directory containing parquet/csv files
+  meta_path: /home/ethch/jepa-fm/data # directory containing parquet/csv files
   voxel_format: reversed
-  crop_size: [128, 128, 128]
+  crop_size: [96, 96, 96] # 96^3 keeps ConvNeXt-Huge training under 48 GiB
   views: 2
 
 optim:
@@ -26,7 +26,7 @@ scheduler: # stepped once per optimiser step
 
 projector: # only feeds the loss terms; probing uses the encoder latents
   _target_: jepa_fm.models.projector.Projector
-  in_dim: 768 # convnextv2_huge stage 4 width
+  in_dim: 2816 # convnextv2_huge stage 4 width
   hidden_dim: 2048
   out_dim: 768 # le-wm keeps the input width; lower it to bottle the loss space
 
@@ -64,14 +64,13 @@ probe: # label-free metrics on the frozen encoder, logged against epochs
       dead_std: 1.0e-3
 
 trainer:
-  lesions_per_batch: 4
+  lesions_per_batch: 2
   num_workers: 8
   epochs: 100
   log_every: 50
   max_grad_norm: 1.0 # global grad norm clip; null to only log the norm
   ckpt_interval: 5 # in epochs. last epoch always saved
   keep_last: 10 # number of ckpts to keep
-  val_every: 5 # in epochs. last epoch always validated
   resume_from: null # path to a checkpoint to continue from
 
 loader:
