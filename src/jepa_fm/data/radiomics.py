@@ -3,7 +3,6 @@ import logging
 import numpy as np
 import SimpleITK as sitk
 import torch
-from radiomics import featureextractor, setVerbosity
 
 
 class RadiomicsExtractor:
@@ -20,6 +19,8 @@ class RadiomicsExtractor:
         feature_classes: tuple[str, ...] = ("firstorder", "glcm", "glrlm"),
         label: int = 1,
     ):
+        from radiomics import featureextractor, setVerbosity # lazy: optional dependency
+
         setVerbosity(logging.ERROR)
         self.label = label
         self.extractor = featureextractor.RadiomicsFeatureExtractor(
