@@ -47,27 +47,9 @@ def build_train_loader(cfg: DictConfig) -> DataLoader:
         cfg.data.crop_size,
         views=cfg.data.views,
         voxel_format=cfg.data.voxel_format,
+        radiomics=False, # train_step never uses the delta, so skip the pyradiomics calls
     )
     return DataLoader(dataset, shuffle=True, drop_last=True, **_loader_kwargs(cfg))
-
-
-def build_val_loader(cfg: DictConfig) -> DataLoader:
-    dataset = PretrainDataset(
-        SplitType.VAL,
-        cfg.data.meta_path,
-        cfg.data.crop_size,
-        views=cfg.data.views,
-        inference=True,
-        voxel_format=cfg.data.voxel_format,
-    )
-    if len(dataset) == 0:
-        raise RuntimeError(f"no {SplitType.VAL} rows under {cfg.data.meta_path}")
-    return DataLoader(
-        dataset,
-        shuffle=False,
-        drop_last=False,
-        **_loader_kwargs(cfg) | {"persistent_workers": False},
-    )
 
 
 def build_probe_loader(cfg: DictConfig) -> DataLoader:
@@ -154,24 +136,6 @@ def train_step(
     return metrics
 
 
-@torch.no_grad()
-def eval_step(
-    net: torch.nn.Module,
-    projector: torch.nn.Module,
-    loss_fn: torch.nn.Module,
-    imgs: torch.Tensor,
-    amp_dtype: torch.dtype | None = None,
-) -> dict[str, float]:
-    with torch.autocast(imgs.device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
-        latents = forward_latents(net, imgs)
-
-    b, v = latents.shape[:2]
-    proj = projector(latents.float().flatten(0, 1)).view(b, v, -1)
-    total, parts = loss_fn(proj)
-
-    return {"loss": total.item(), **{name: value.item() for name, value in parts.items()}}
-
-
 def flatten_config(tree: dict, prefix: str = "") -> dict[str, str | int | float | bool]:
     """Convert config to flat structure scalars"""
     flat: dict[str, str | int | float | bool] = {}
@@ -196,6 +160,11 @@ def checkpoint_dir(run_name: str, run_id: str) -> Path:
     return Path(root).expanduser() / f"{run_name}_{stamp}_{run_id}"
 
 
+def unwrap(net: torch.nn.Module) -> torch.nn.Module:
+    """The module behind a torch.compile wrapper, so checkpoints and probes stay eager."""
+    return getattr(net, "_orig_mod", net)
+
+
 def save_checkpoint(
     path: Path,
     epoch: int,
@@ -209,7 +178,7 @@ def save_checkpoint(
     torch.save(
         {
             "epoch": epoch,
-            "model": net.state_dict(),
+            "model": unwrap(net).state_dict(),
             "projector": projector.state_dict(),
             "optimiser": optimiser.state_dict(),
             "scheduler": scheduler.state_dict(),
@@ -228,7 +197,7 @@ def load_checkpoint(
     scheduler: torch.optim.lr_scheduler.LRScheduler,
 ) -> int:
     ckpt = torch.load(path, map_location="cpu", weights_only=True)
-    net.load_state_dict(ckpt["model"])
+    unwrap(net).load_state_dict(ckpt["model"])
     projector.load_state_dict(ckpt["projector"])
     optimiser.load_state_dict(ckpt["optimiser"])
     if "scheduler" in ckpt:
@@ -303,7 +272,7 @@ def run_probe(
 ) -> None:
     started = time.perf_counter()
     embeddings, labels = extract_embeddings(
-        net, projector, loader, cfg.probe.spaces, device, AMP_DTYPE
+        unwrap(net), projector, loader, cfg.probe.spaces, device, AMP_DTYPE
     )
     values: dict[str, float] = {
         "probe/d": float(next(iter(embeddings.values())).shape[1])
@@ -347,12 +316,12 @@ def main(cfg: DictConfig) -> None:
     amp_dtype = AMP_DTYPE
 
     net, projector = build_model(cfg, device)
+    net = torch.compile(net)
     loss_fn = instantiate(cfg.loss).to(device)
     optimiser = build_optimiser(
         cfg.optim, [*net.parameters(), *projector.parameters()]
     )
     train_loader = build_train_loader(cfg)
-    val_loader = build_val_loader(cfg)
     probe_loader = build_probe_loader(cfg)
     probe_metrics = instantiate(cfg.probe.metrics)
     scheduler = build_lr_scheduler(
@@ -400,7 +369,8 @@ def main(cfg: DictConfig) -> None:
                     projector,
                     optimiser,
                     loss_fn,
-                    imgs.to(device, non_blocking=True),
+                    imgs.as_subclass(torch.Tensor).to(device, non_blocking=True),
+                    # MONAI MetaTensor makes dynamo recompile: it guards on the subclass
                     amp_dtype,
                     cfg.trainer.max_grad_norm,
                 )
@@ -416,26 +386,6 @@ def main(cfg: DictConfig) -> None:
                     )
 
             is_last = epoch == cfg.trainer.epochs - 1
-            if cfg.trainer.val_every > 0 and (
-                is_last or (epoch + 1) % cfg.trainer.val_every == 0
-            ):
-                net.eval()
-                projector.eval()
-                sums: dict[str, float] = {}
-                for imgs, _, _, _ in val_loader:
-                    metrics = eval_step(
-                        net,
-                        projector,
-                        loss_fn,
-                        imgs.to(device, non_blocking=True),
-                        amp_dtype,
-                    )
-                    sums = {k: sums.get(k, 0.0) + v for k, v in metrics.items()}
-                metrics_log.log(
-                    {f"val/{name}": total / len(val_loader) for name, total in sums.items()},
-                    step=step,
-                )
-
             if is_last or (epoch + 1) % cfg.trainer.ckpt_interval == 0:
                 saved.append(
                     save_checkpoint(
