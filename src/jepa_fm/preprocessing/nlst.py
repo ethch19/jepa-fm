@@ -39,7 +39,6 @@ WORKLIST_COLUMNS = [
     "scan_stem",
     "scan_year",
     "batch",
-    "in_picks",
     "scan_path",
     "mask_path",
 ]
@@ -157,14 +156,12 @@ def selection_table(
 
 
 def worklist_table(
-    scans: dict[str, list[Scan]],
     masks: dict[str, Path],
     cancyr: dict[str, int],
     mask_root: Path,
     picks: list[tuple[Scan, str]],
 ) -> pd.DataFrame:
-    """Every usable scan still missing a mask, plus where that mask must land."""
-    picked = {scan.stem for scan, _ in picks}
+    """Picked scans that still need a mask, plus where that mask must land."""
     rows = [
         {
             "patient_id": scan.patient_id,
@@ -172,14 +169,12 @@ def worklist_table(
             "scan_stem": scan.stem,
             "scan_year": scan.year,
             "batch": scan.path.parent.parent.name,
-            "in_picks": scan.stem in picked,
             "scan_path": str(scan.path),
             "mask_path": str(
                 mask_root / scan.path.parent.parent.name / f"{scan.stem}{MASK_SUFFIX}"
             ),
         }
-        for patient_scans in scans.values()
-        for scan in patient_scans
+        for scan, _ in picks
         if scan.stem not in masks
     ]
     return pd.DataFrame(rows, columns=WORKLIST_COLUMNS).sort_values(
@@ -224,7 +219,7 @@ def main() -> None:
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report.to_csv(report_path, index=False)
 
-    worklist = worklist_table(scans, masks, cancyr, args.mask_root, picks)
+    worklist = worklist_table(masks, cancyr, args.mask_root, picks)
     worklist_path = args.worklist or args.out / WORKLIST_NAME
     worklist_path.parent.mkdir(parents=True, exist_ok=True)
     worklist.to_csv(worklist_path, index=False)
@@ -243,8 +238,8 @@ def main() -> None:
     )
     logging.info(f"selection report: {report_path}")
     logging.info(
-        f"segmentation worklist: {len(worklist)} scans "
-        f"({int(worklist['in_picks'].sum())} in current picks) -> {worklist_path}"
+        f"segmentation worklist: {len(worklist)} picked scans without a mask "
+        f"-> {worklist_path}"
     )
     logging.info(f"{len(jobs)} scan+mask pairs to preprocess")
     if args.dry_run:
