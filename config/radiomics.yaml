@@ -1,0 +1,27 @@
+imageType:
+    Original: {}
+    LoG: {'sigma' : [1.0, 3.0]}
+    Wavelet:
+        binWidth: 10
+    Square: {}
+    SquareRoot: {}
+    Logarithm: {}
+    Exponential: {}
+
+featureClass:
+   shape:
+   glcm:
+   glrlm:
+   firstorder:
+   glszm:
+   gldm:
+   ngtdm:
+
+setting:
+    normalize: false
+    normalizeScale: 1
+    binWidth: 25
+    label: 1
+    interpolator: 'sitkBSpline'
+    resampledPixelSpacing: [1, 1, 1]
+    weightingNorm:
