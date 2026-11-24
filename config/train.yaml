@@ -12,23 +12,31 @@ model:
 data:
   meta_path: /home/ethch/jepa-fm/data # directory containing parquet/csv files
   voxel_format: reversed
-  crop_size: [96, 96, 96] # 96^3 keeps ConvNeXt-Huge training under 48 GiB
-  views: 2
+  crop_size: [96, 96, 96]
+  views: 3
+  radiomics_path: null
 
 optim:
   _target_: torch.optim.AdamW
   lr: 5.0e-4
   weight_decay: 5.0e-4
 
-scheduler: # stepped once per optimiser step
+scheduler:
   warmup_steps: 500
   min_lr_ratio: 1.0e-3 # final lr, as a fraction of optim.lr
 
-projector: # only feeds the loss terms; probing uses the encoder latents
+projector: # used only to compute loss terms
   _target_: jepa_fm.models.projector.Projector
-  in_dim: 2816 # convnextv2_huge stage 4 width
+  in_dim: 2816
   hidden_dim: 2048
-  out_dim: 768 # le-wm keeps the input width; lower it to bottle the loss space
+  out_dim: 768
+
+predictor:
+  _target_: jepa_fm.models.predictor.ConditionedPredictor
+  dim: ${projector.in_dim} # must match projector.in_dim
+  depth: 3
+  hidden_dim: ${projector.in_dim}
+  cond_hidden_dim: 1024
 
 loss:
   _target_: jepa_fm.losses.CompositeLoss
@@ -38,18 +46,22 @@ loss:
       _target_: jepa_fm.losses.LatentMSE
       pairs: same_lesion # all, same_lesion, diff_lesion
       order: combination # combination, permutation
+    predicted_mse:
+      _target_: jepa_fm.losses.PredictedMSE
+      pairs: diff_lesion
+      order: combination
     sigreg: # applies to all
       _target_: jepa_fm.losses.SIGReg
-      weight: 0.09
+      weight: 0.15
       knots: 17
       num_proj: 1024
 
-probe: # label-free metrics on the frozen encoder, logged against epochs
+probe:
   _recursive_: true
-  spaces: [enc] # enc, proj -- proj is the space the loss actually sees
-  samples: 1024 # seeded subset of train rows; null for all of them
-  every_n_ckpt: 1 # probe on every Nth checkpoint that gets written
-  group_by: null # null (one 'all' group) or dataset (one group per metadata file)
+  spaces: [enc] # enc, proj
+  samples: 1024
+  every_n_ckpt: 1
+  group_by: null # null = all, dataset
   metrics:
     rankme:
       _target_: jepa_fm.probe.RankMe
@@ -64,11 +76,11 @@ probe: # label-free metrics on the frozen encoder, logged against epochs
       dead_std: 1.0e-3
 
 trainer:
-  lesions_per_batch: 2
+  lesions_per_batch: 10
   num_workers: 8
   epochs: 100
-  log_every: 50
-  max_grad_norm: 1.0 # global grad norm clip; null to only log the norm
+  log_every: 50 # step
+  max_grad_norm: 1.0
   ckpt_interval: 5 # in epochs. last epoch always saved
   keep_last: 10 # number of ckpts to keep
   resume_from: null # path to a checkpoint to continue from

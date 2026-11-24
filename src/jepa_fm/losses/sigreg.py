@@ -17,7 +17,7 @@ class SIGReg(LossTerm):
         self.register_buffer("phi", window)
         self.register_buffer("weights", weights * window)
 
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
+    def forward(self, z: torch.Tensor, **ctx) -> torch.Tensor:
         # (V, B, C): the sample axis is B, so V becomes a stack of statistics
         proj = z.transpose(0, 1).float()  # fp32
         a = torch.randn(proj.size(-1), self.num_proj, device=proj.device, dtype=proj.dtype)

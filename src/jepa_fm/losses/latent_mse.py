@@ -16,7 +16,7 @@ class LatentMSE(LossTerm):
         self.pairs = PairType(pairs)
         self.order = PairOrder(order)
 
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
+    def forward(self, z: torch.Tensor, **ctx) -> torch.Tensor:
         n_lesions, n_views, _ = z.shape
         a, b = pair_indices(n_lesions, n_views, self.pairs, self.order, z.device)
         z = z.flatten(0, 1)  # (B * V, C) = (lesions * views, channels)

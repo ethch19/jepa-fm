@@ -1,3 +1,4 @@
+import json
 import pandas as pd
 from pathlib import Path
 import numpy as np
@@ -6,8 +7,8 @@ from torch.utils.data import Dataset
 from torchvision.transforms import v2
 from typing import NamedTuple
 import monai.transforms as mai_tf
+import pyarrow.parquet as pq
 
-from jepa_fm.data.radiomics import RadiomicsExtractor
 from jepa_fm.data.utils import (
     VoxelFormat,
     SplitType,
@@ -17,6 +18,8 @@ from jepa_fm.data.utils import (
 )
 from jepa_fm.transforms import RandomZoom3D
 
+PARQUET_META_KEY = b"jepa_radiomics"
+
 _EXTENSIONS = [".csv", ".parquet"]
 
 
@@ -24,8 +27,8 @@ class Lesion(NamedTuple):
     uuid: str
     npy_img_path: str
     npy_mask_path: str
-    centroid: tuple[float, float, float]  # stored dependining on voxel_format
-    dataset: str  # stem of the metadata file this row came from
+    centroid: tuple[float, float, float]
+    dataset: str  # stem of the metadata file
 
 
 class PretrainDataset(Dataset):
@@ -59,12 +62,11 @@ class PretrainDataset(Dataset):
         views: int = 1,
         inference: bool = False,
         voxel_format: VoxelFormat = VoxelFormat.REVERSED,
-        radiomics: bool = True,
+        radiomics_path: str | Path | None = None,
     ):
         self.split = split
         self.meta_dir = Path(meta_dir)
         self.views = views
-        self.radiomics = RadiomicsExtractor() if radiomics and views > 1 else None
         self.crop_size = tuple(int(round(s)) for s in crop_size)
         self.voxel_format = (
             VoxelFormat[voxel_format.upper()]
@@ -113,6 +115,13 @@ class PretrainDataset(Dataset):
                 f"No files found under {self.meta_dir} with {_EXTENSIONS}"
             )
 
+        duplicated = samples["node_id"].duplicated()
+        if duplicated.any():
+            raise RuntimeError(
+                f"{int(duplicated.sum())} duplicate node_id(s) under {self.meta_dir}, "
+                f"first {samples.loc[duplicated, 'node_id'].iloc[0]!r}"
+            )
+
         samples = samples.sort_values(by="node_id", ascending=True).reset_index(
             drop=True
         )
@@ -145,17 +154,49 @@ class PretrainDataset(Dataset):
                     "voxel_format not specified when initialising dataset"
                 )
 
+        self.features, self.row_of = self._load_radiomics(radiomics_path)
+
     def __len__(self):
         return len(self.records)
 
-    def __getitem__(self, idx: int):
-        """Returns (V, D, H, W) where views are extracted from the same centroid crop, just different transformations
+    def _load_radiomics(self, path: str | Path | None):
+        if path is None:
+            return None, {}
+        cache_path = Path(path).with_suffix(".parquet")
+        if not cache_path.is_file():
+            raise RuntimeError(f"radiomics cache missing: {cache_path}")
+        table = pq.read_table(cache_path)
+        raw_meta = table.schema.metadata or {}
+        if PARQUET_META_KEY not in raw_meta:
+            raise RuntimeError(
+                f"radiomics cache {cache_path.name}: no {PARQUET_META_KEY!r} metadata"
+            )
+        cache_meta = json.loads(raw_meta[PARQUET_META_KEY])
+        for key, value in (
+            ("crop_size", list(self.crop_size)),
+            ("voxel_format", str(self.voxel_format)),
+        ):
+            if cache_meta.get(key) != value:
+                raise RuntimeError(
+                    f"radiomics cache {cache_path.name}: {key} "
+                    f"{cache_meta.get(key)!r} != dataset {value!r}"
+                )
 
-        plus the lesion and dataset this row belongs to, as plain strings so the
-        default collate hands them back as a list rather than mangling a pandas row,
-        plus the signed radiomics difference between view 0 and every other view
-        as (V - 1, F).
-        """
+        frame = table.to_pandas()
+        row_of = {str(uuid): i for i, uuid in enumerate(frame["uuid"])}
+        missing = [row.uuid for row in self.records if str(row.uuid) not in row_of]
+        if missing:
+            raise RuntimeError(
+                f"radiomics cache {cache_path.name}: {len(missing)} of "
+                f"{len(self.records)} records missing, first {missing[0]!r}"
+            )
+        return (
+            frame.drop(columns="uuid").to_numpy(dtype=np.float32, copy=True),
+            row_of,
+        )
+
+    def __getitem__(self, idx: int):
+        """Returns (V, D, H, W) of the same tumour crop"""
         row = self.records[idx]
         img = load_file(row.npy_img_path)
 
@@ -163,10 +204,9 @@ class PretrainDataset(Dataset):
 
         views = [self.transform(patch) for _ in range(self.views)]
 
-        if self.radiomics is None:
-            delta = torch.zeros(0)
+        if self.features is None:
+            features = torch.zeros(0)
         else:
-            features = np.stack([self.radiomics(view) for view in views])
-            delta = torch.from_numpy(features[1:] - features[0])
+            features = torch.from_numpy(self.features[self.row_of[row.uuid]])
 
-        return torch.stack(views), row.uuid, row.dataset, delta
+        return torch.stack(views), row.uuid, row.dataset, features

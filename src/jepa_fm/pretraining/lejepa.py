@@ -47,7 +47,7 @@ def build_train_loader(cfg: DictConfig) -> DataLoader:
         cfg.data.crop_size,
         views=cfg.data.views,
         voxel_format=cfg.data.voxel_format,
-        radiomics=False, # train_step never uses the delta, so skip the pyradiomics calls
+        radiomics_path=cfg.data.radiomics_path,
     )
     return DataLoader(dataset, shuffle=True, drop_last=True, **_loader_kwargs(cfg))
 
@@ -90,7 +90,9 @@ def build_lr_scheduler(
         if step < warmup_steps:
             return (step + 1) / warmup_steps
         progress = min(1.0, (step - warmup_steps) / max(1, total_steps - warmup_steps))
-        return min_lr_ratio + (1 - min_lr_ratio) * 0.5 * (1 + math.cos(math.pi * progress))
+        return min_lr_ratio + (1 - min_lr_ratio) * 0.5 * (
+            1 + math.cos(math.pi * progress)
+        )
 
     return torch.optim.lr_scheduler.LambdaLR(optimiser, factor)
 
@@ -98,27 +100,39 @@ def build_lr_scheduler(
 def train_step(
     net: torch.nn.Module,
     projector: torch.nn.Module,
+    predictor: torch.nn.Module | None,
     optimiser: torch.optim.Optimizer,
     loss_fn: torch.nn.Module,
     imgs: torch.Tensor,
+    features: torch.Tensor,
     amp_dtype: torch.dtype | None = None,
     max_grad_norm: float | None = None,
 ) -> dict[str, float]:
-    with torch.autocast(imgs.device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
+    with torch.autocast(
+        imgs.device.type, dtype=amp_dtype, enabled=amp_dtype is not None
+    ):
         latents = forward_latents(net, imgs)
 
     b, v = latents.shape[:2]
     proj = projector(latents.float().flatten(0, 1)).view(b, v, -1)
-    total, parts = loss_fn(proj)
+    total, parts = loss_fn(
+        proj,
+        latents=latents,
+        features=features,
+        predictor=predictor,
+        projector=projector,
+    )
 
     optimiser.zero_grad(set_to_none=True)
     total.backward()
 
+    modules = [net, projector] if predictor is None else [net, projector, predictor]
     params = [
-        p for p in itertools.chain(net.parameters(), projector.parameters()) if p.grad is not None
+        p
+        for p in itertools.chain(*(m.parameters() for m in modules))
+        if p.grad is not None
     ]
     if max_grad_norm:
-        # returns the pre-clipping norm, which is the number worth watching
         grad_norm = torch.nn.utils.clip_grad_norm_(
             params, max_grad_norm, error_if_nonfinite=False
         )
@@ -170,6 +184,7 @@ def save_checkpoint(
     epoch: int,
     net: torch.nn.Module,
     projector: torch.nn.Module,
+    predictor: torch.nn.Module | None,
     optimiser: torch.optim.Optimizer,
     scheduler: torch.optim.lr_scheduler.LRScheduler,
     cfg: DictConfig,
@@ -180,6 +195,7 @@ def save_checkpoint(
             "epoch": epoch,
             "model": unwrap(net).state_dict(),
             "projector": projector.state_dict(),
+            "predictor": None if predictor is None else predictor.state_dict(),
             "optimiser": optimiser.state_dict(),
             "scheduler": scheduler.state_dict(),
             "config": OmegaConf.to_container(cfg, resolve=True),
@@ -193,12 +209,15 @@ def load_checkpoint(
     path: Path,
     net: torch.nn.Module,
     projector: torch.nn.Module,
+    predictor: torch.nn.Module | None,
     optimiser: torch.optim.Optimizer,
     scheduler: torch.optim.lr_scheduler.LRScheduler,
 ) -> int:
     ckpt = torch.load(path, map_location="cpu", weights_only=True)
     unwrap(net).load_state_dict(ckpt["model"])
     projector.load_state_dict(ckpt["projector"])
+    if predictor is not None and ckpt.get("predictor"):
+        predictor.load_state_dict(ckpt["predictor"])
     optimiser.load_state_dict(ckpt["optimiser"])
     if "scheduler" in ckpt:
         scheduler.load_state_dict(ckpt["scheduler"])
@@ -245,6 +264,25 @@ def build_model(
     net = instantiate(cfg.model).to(device)
     projector = instantiate(cfg.projector).to(device)
     return net, projector
+
+
+def build_predictor(
+    cfg: DictConfig, features: torch.Tensor | None, device: torch.device
+) -> torch.nn.Module | None:
+    if cfg.predictor is None:
+        return None
+    if cfg.predictor.dim != cfg.projector.in_dim:
+        raise RuntimeError(
+            f"predictor.dim={cfg.predictor.dim} must equal projector.in_dim="
+            f"{cfg.projector.in_dim}: the predictor works in encoder space"
+        )
+    cond_dim = 0 if features is None else features.shape[1]
+    if cond_dim == 0:
+        raise RuntimeError(
+            "data.radiomics_path is unset or holds no feature columns: the predictor "
+            "needs the radiomics parquet to build its conditioning input"
+        )
+    return instantiate(cfg.predictor, cond_dim=cond_dim).to(device)
 
 
 def build_optimiser(
@@ -316,13 +354,15 @@ def main(cfg: DictConfig) -> None:
     amp_dtype = AMP_DTYPE
 
     net, projector = build_model(cfg, device)
-    net = torch.compile(net)
-    loss_fn = instantiate(cfg.loss).to(device)
-    optimiser = build_optimiser(
-        cfg.optim, [*net.parameters(), *projector.parameters()]
-    )
     train_loader = build_train_loader(cfg)
     probe_loader = build_probe_loader(cfg)
+    predictor = build_predictor(cfg, train_loader.dataset.features, device)
+    net = torch.compile(net)
+    loss_fn = instantiate(cfg.loss).to(device)
+    params = [*net.parameters(), *projector.parameters()]
+    if predictor is not None:
+        params += [*predictor.parameters()]
+    optimiser = build_optimiser(cfg.optim, params)
     probe_metrics = instantiate(cfg.probe.metrics)
     scheduler = build_lr_scheduler(
         optimiser, total_steps=len(train_loader) * cfg.trainer.epochs, **cfg.scheduler
@@ -346,6 +386,7 @@ def main(cfg: DictConfig) -> None:
                     Path(cfg.trainer.resume_from).expanduser(),
                     net,
                     projector,
+                    predictor,
                     optimiser,
                     scheduler,
                 )
@@ -361,16 +402,21 @@ def main(cfg: DictConfig) -> None:
         for epoch in range(start_epoch, cfg.trainer.epochs):
             net.train()
             projector.train()
-            progress = tqdm(train_loader, desc=f"epoch {epoch}", unit="batch", leave=False)
+            if predictor is not None:
+                predictor.train()
+            progress = tqdm(
+                train_loader, desc=f"epoch {epoch}", unit="batch", leave=False
+            )
 
-            for imgs, _, _, _ in progress:
+            for imgs, _, _, features in progress:
                 metrics = train_step(
                     net,
                     projector,
+                    predictor,
                     optimiser,
                     loss_fn,
                     imgs.as_subclass(torch.Tensor).to(device, non_blocking=True),
-                    # MONAI MetaTensor makes dynamo recompile: it guards on the subclass
+                    features.to(device, non_blocking=True),
                     amp_dtype,
                     cfg.trainer.max_grad_norm,
                 )
@@ -393,6 +439,7 @@ def main(cfg: DictConfig) -> None:
                         epoch,
                         net,
                         projector,
+                        predictor,
                         optimiser,
                         scheduler,
                         cfg,
