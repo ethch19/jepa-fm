@@ -22,10 +22,27 @@ DEFAULT_MASK_ROOT = Path("/mnt/rds/NLST/Masks/tumour_masks")
 DEFAULT_OUT = Path("/mnt/ethch/data/NLST/npy")
 DEFAULT_PARTICIPANTS = Path("/mnt/rds/NLST/Clinical/participant_d040722.csv")
 REPORT_NAME = "nlst_scan_selection.csv"
+WORKLIST_NAME = "nlst_segmentation_worklist.csv"
 
 MATCHED = "Matched"
 MATCHED_LATER = "Matched later scan"
 NO_SCAN = "No matching or later scan"
+
+# topogram: 2 slices at ~265 mm z spacing, no anatomy worth segmenting
+SCOUT_MARKER = "SCOUT"
+# a re-reconstruction of the same series with wider z coverage; it wins over the base
+EQ_SUFFIX = "_Eq_1"
+
+WORKLIST_COLUMNS = [
+    "patient_id",
+    "cancyr",
+    "scan_stem",
+    "scan_year",
+    "batch",
+    "in_picks",
+    "scan_path",
+    "mask_path",
+]
 
 
 @dataclass(frozen=True)
@@ -56,14 +73,24 @@ def load_cancyr(path: Path) -> dict[str, int]:
     }
 
 
+def is_scout(stem: str) -> bool:
+    return SCOUT_MARKER in stem.upper()
+
+
 def index_scans(scan_root: Path) -> dict[str, list[Scan]]:
-    scans: dict[str, list[Scan]] = defaultdict(list)
+    """Usable scans per patient: no topograms, one volume per series."""
+    kept: dict[str, dict[str, Scan]] = defaultdict(dict)
     for path in index_files(scan_root, SCAN_SUFFIX):
         stem = path.name[: -len(SCAN_SUFFIX)]
         year = stem_year(stem)
-        if year is not None:
-            scans[path.parent.name].append(Scan(path.parent.name, year, stem, path))
-    return scans
+        if year is None or is_scout(stem):
+            continue
+        patient_id = path.parent.name
+        series = kept[patient_id]
+        key = stem.removesuffix(EQ_SUFFIX)
+        if key not in series or stem.endswith(EQ_SUFFIX):
+            series[key] = Scan(patient_id, year, stem, path)
+    return {patient_id: list(series.values()) for patient_id, series in kept.items()}
 
 
 def index_masks(mask_root: Path) -> dict[str, Path]:
@@ -108,6 +135,7 @@ def selection_table(
             "scan_stem": scan.stem,
             "scan_year": scan.year,
             "has_mask": scan.stem in masks,
+            "scan_path": str(scan.path),
         }
         for scan, status in picks
     ]
@@ -119,11 +147,43 @@ def selection_table(
             "scan_stem": pd.NA,
             "scan_year": pd.NA,
             "has_mask": False,
+            "scan_path": pd.NA,
         }
         for patient_id, target in unmatched
     )
     return pd.DataFrame(rows).sort_values(
         ["patient_id", "scan_year", "scan_stem"], na_position="last"
+    )
+
+
+def worklist_table(
+    scans: dict[str, list[Scan]],
+    masks: dict[str, Path],
+    cancyr: dict[str, int],
+    mask_root: Path,
+    picks: list[tuple[Scan, str]],
+) -> pd.DataFrame:
+    """Every usable scan still missing a mask, plus where that mask must land."""
+    picked = {scan.stem for scan, _ in picks}
+    rows = [
+        {
+            "patient_id": scan.patient_id,
+            "cancyr": cancyr.get(scan.patient_id, pd.NA),
+            "scan_stem": scan.stem,
+            "scan_year": scan.year,
+            "batch": scan.path.parent.parent.name,
+            "in_picks": scan.stem in picked,
+            "scan_path": str(scan.path),
+            "mask_path": str(
+                mask_root / scan.path.parent.parent.name / f"{scan.stem}{MASK_SUFFIX}"
+            ),
+        }
+        for patient_scans in scans.values()
+        for scan in patient_scans
+        if scan.stem not in masks
+    ]
+    return pd.DataFrame(rows, columns=WORKLIST_COLUMNS).sort_values(
+        ["patient_id", "scan_year", "scan_stem"], ignore_index=True
     )
 
 
@@ -134,6 +194,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out", type=Path, default=DEFAULT_OUT)
     parser.add_argument("--participants", type=Path, default=DEFAULT_PARTICIPANTS)
     parser.add_argument("--report", type=Path, default=None)
+    parser.add_argument("--worklist", type=Path, default=None)
     parser.add_argument("--table", type=Path, default=None)
     parser.add_argument("--workers", type=int, default=0)
     parser.add_argument("--sitk-threads", type=int, default=1)
@@ -162,6 +223,11 @@ def main() -> None:
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report.to_csv(report_path, index=False)
 
+    worklist = worklist_table(scans, masks, cancyr, args.mask_root, picks)
+    worklist_path = args.worklist or args.out / WORKLIST_NAME
+    worklist_path.parent.mkdir(parents=True, exist_ok=True)
+    worklist.to_csv(worklist_path, index=False)
+
     statuses = Counter(status for _, status in picks)
     collisions = Counter((scan.patient_id, scan.year) for scan, _ in picks)
     logging.info(
@@ -175,6 +241,10 @@ def main() -> None:
         f"year_with_multiple_series={sum(1 for n in collisions.values() if n > 1)}"
     )
     logging.info(f"selection report: {report_path}")
+    logging.info(
+        f"segmentation worklist: {len(worklist)} scans "
+        f"({int(worklist['in_picks'].sum())} in current picks) -> {worklist_path}"
+    )
     logging.info(f"{len(jobs)} scan+mask pairs to preprocess")
 
     if args.limit:
