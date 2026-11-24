@@ -199,6 +199,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--workers", type=int, default=0)
     parser.add_argument("--sitk-threads", type=int, default=1)
     parser.add_argument("--limit", type=int, default=0)
+    parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
@@ -246,6 +247,9 @@ def main() -> None:
         f"({int(worklist['in_picks'].sum())} in current picks) -> {worklist_path}"
     )
     logging.info(f"{len(jobs)} scan+mask pairs to preprocess")
+    if args.dry_run:
+        logging.info("dry run: reports written, preprocessing skipped")
+        return
 
     if args.limit:
         jobs = jobs[: args.limit]
