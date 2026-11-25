@@ -23,7 +23,7 @@ dependencies = [
 [project.scripts]
 jepa-train = "jepa_fm.pretraining.lejepa:main"
 jepa-eval = "jepa_fm.evals.extract:main"
-jepa-precompute-radiomics = "jepa_fm.data.radiomics:main"
+jepa-precompute-radiomics = "jepa_fm.data._radiomics_cli:main"
 jepa-preprocess-nlst = "jepa_fm.preprocessing.nlst:main"
 
 [build-system]

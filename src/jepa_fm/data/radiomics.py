@@ -66,7 +66,8 @@ class RadiomicsExtractor:
 
 
 def get_optimal_jobs() -> int:
-    return min(int((os.cpu_count() or 1) * 0.70), 6)
+    """70% of the cores; workers run one BLAS thread each (see _radiomics_cli)."""
+    return max(1, int((os.cpu_count() or 1) * 0.70))
 
 
 _EXTRACTOR: RadiomicsExtractor | None = None
