@@ -155,7 +155,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--out",
         required=True,
         type=Path,
-        help="parquet path, make sure this is outside --meta-path",
+        help="parquet path, may live inside --meta-path; the loader skips "
+        "files carrying the radiomics metadata",
     )
     parser.add_argument(
         "--voxel-format",
@@ -183,9 +184,6 @@ def main(argv: list[str] | None = None) -> None:
     if workers < 1:
         raise SystemExit(f"--workers must be 1 or more, got {workers}")
     out = args.out.with_suffix(".parquet")
-    meta_path = Path(args.meta_path).resolve()
-    if out.resolve().is_relative_to(meta_path):
-        raise SystemExit(f"--out {out} is inside --meta-path {meta_path}")
 
     dataset = PretrainDataset(
         SplitType.TRAIN,

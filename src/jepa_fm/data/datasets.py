@@ -23,6 +23,13 @@ PARQUET_META_KEY = b"jepa_radiomics"
 _EXTENSIONS = [".csv", ".parquet"]
 
 
+def _is_radiomics_cache(file: Path) -> bool:
+    """Caches written by the radiomics CLI carry PARQUET_META_KEY in their schema."""
+    if file.suffix != ".parquet":
+        return False
+    return PARQUET_META_KEY in (pq.read_schema(file).metadata or {})
+
+
 class Lesion(NamedTuple):
     uuid: str
     npy_img_path: str
@@ -62,7 +69,6 @@ class PretrainDataset(Dataset):
         views: int = 1,
         inference: bool = False,
         voxel_format: VoxelFormat = VoxelFormat.REVERSED,
-        radiomics_path: str | Path | None = None,
     ):
         self.split = split
         self.meta_dir = Path(meta_dir)
@@ -81,6 +87,8 @@ class PretrainDataset(Dataset):
         data_dfs = []
         for file in self.meta_dir.rglob("*"):
             if file.is_file() and file.suffix in _EXTENSIONS:
+                if _is_radiomics_cache(file):
+                    continue
                 tabular = load_col_file(
                     file,
                     cols=[
@@ -154,46 +162,73 @@ class PretrainDataset(Dataset):
                     "voxel_format not specified when initialising dataset"
                 )
 
-        self.features, self.row_of = self._load_radiomics(radiomics_path)
+        self.features, self.row_of = self._load_radiomics()
 
     def __len__(self):
         return len(self.records)
 
-    def _load_radiomics(self, path: str | Path | None):
-        if path is None:
+    def _load_radiomics(self):
+        """Every cache under meta_dir, provided they share one feature space."""
+        caches = sorted(
+            path for path in self.meta_dir.rglob("*.parquet") if _is_radiomics_cache(path)
+        )
+        if not caches:
             return None, {}
-        cache_path = Path(path).with_suffix(".parquet")
-        if not cache_path.is_file():
-            raise RuntimeError(f"radiomics cache missing: {cache_path}")
-        table = pq.read_table(cache_path)
-        raw_meta = table.schema.metadata or {}
-        if PARQUET_META_KEY not in raw_meta:
-            raise RuntimeError(
-                f"radiomics cache {cache_path.name}: no {PARQUET_META_KEY!r} metadata"
-            )
-        cache_meta = json.loads(raw_meta[PARQUET_META_KEY])
-        for key, value in (
-            ("crop_size", list(self.crop_size)),
-            ("voxel_format", str(self.voxel_format)),
-        ):
-            if cache_meta.get(key) != value:
-                raise RuntimeError(
-                    f"radiomics cache {cache_path.name}: {key} "
-                    f"{cache_meta.get(key)!r} != dataset {value!r}"
-                )
 
-        frame = table.to_pandas()
-        row_of = {str(uuid): i for i, uuid in enumerate(frame["uuid"])}
-        missing = [row.uuid for row in self.records if str(row.uuid) not in row_of]
+        frames: dict[Path, pd.DataFrame] = {}
+        feature_columns: list[str] | None = None
+        for cache_path in caches:
+            table = pq.read_table(cache_path)
+            cache_meta = json.loads((table.schema.metadata or {})[PARQUET_META_KEY])
+            for key, value in (
+                ("crop_size", list(self.crop_size)),
+                ("voxel_format", str(self.voxel_format)),
+            ):
+                if cache_meta.get(key) != value:
+                    raise RuntimeError(
+                        f"radiomics cache {cache_path.name}: {key} "
+                        f"{cache_meta.get(key)!r} != dataset {value!r}"
+                    )
+
+            frame = table.to_pandas().set_index("uuid")
+            repeated = frame.index.duplicated()
+            if repeated.any():
+                raise RuntimeError(
+                    f"radiomics cache {cache_path.name}: duplicated uuid "
+                    f"{frame.index[repeated][0]!r}"
+                )
+            if feature_columns is None:
+                feature_columns = list(frame.columns)
+            elif list(frame.columns) != feature_columns:
+                raise RuntimeError(
+                    f"radiomics caches {caches[0].name} and {cache_path.name} "
+                    f"disagree on feature columns ({len(feature_columns)} vs "
+                    f"{len(frame.columns)}): extract every dataset in one "
+                    "jepa-precompute-radiomics run so they share one feature space"
+                )
+            frames[cache_path] = frame
+
+        origin: dict[str, Path] = {}
+        for cache_path, frame in frames.items():
+            for uuid in frame.index:
+                if str(uuid) in origin:
+                    raise RuntimeError(
+                        f"uuid {str(uuid)!r} is in both {origin[str(uuid)].name} "
+                        f"and {cache_path.name}"
+                    )
+                origin[str(uuid)] = cache_path
+
+        missing = [row.uuid for row in self.records if str(row.uuid) not in origin]
         if missing:
+            names = ", ".join(path.name for path in caches)
             raise RuntimeError(
-                f"radiomics cache {cache_path.name}: {len(missing)} of "
+                f"radiomics caches {names}: {len(missing)} of "
                 f"{len(self.records)} records missing, first {missing[0]!r}"
             )
-        return (
-            frame.drop(columns="uuid").to_numpy(dtype=np.float32, copy=True),
-            row_of,
-        )
+
+        frame = pd.concat(frames.values())
+        row_of = {str(uuid): i for i, uuid in enumerate(frame.index)}
+        return frame.to_numpy(dtype=np.float32, copy=True), row_of
 
     def __getitem__(self, idx: int):
         """Returns (V, D, H, W) of the same tumour crop"""

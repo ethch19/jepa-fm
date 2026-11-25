@@ -47,7 +47,6 @@ def build_train_loader(cfg: DictConfig) -> DataLoader:
         cfg.data.crop_size,
         views=cfg.data.views,
         voxel_format=cfg.data.voxel_format,
-        radiomics_path=cfg.data.radiomics_path,
     )
     return DataLoader(dataset, shuffle=True, drop_last=True, **_loader_kwargs(cfg))
 
@@ -279,8 +278,9 @@ def build_predictor(
     cond_dim = 0 if features is None else features.shape[1]
     if cond_dim == 0:
         raise RuntimeError(
-            "data.radiomics_path is unset or holds no feature columns: the predictor "
-            "needs the radiomics parquet to build its conditioning input"
+            "no radiomics cache under data.meta_path: the predictor needs a "
+            "*_radiomics.parquet (PARQUET_META_KEY in its schema) to build its "
+            "conditioning input"
         )
     return instantiate(cfg.predictor, cond_dim=cond_dim).to(device)
 
