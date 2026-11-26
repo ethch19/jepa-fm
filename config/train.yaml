@@ -52,7 +52,7 @@ loss:
       order: combination
     sigreg: # applies to all
       _target_: jepa_fm.losses.SIGReg
-      weight: 0.15
+      weight: 0.1
       knots: 17
       num_proj: 1024
 
