@@ -397,7 +397,9 @@ def main(cfg: DictConfig) -> None:
         step = 0
         n_ckpt = 0
         saved: list[Path] = []
-        metrics_log = MetricLog()
+        # log_every already throttles, so flush each point: with the default
+        # flush_every=50 the first upload waited 50 logged points = 2500 steps
+        metrics_log = MetricLog(flush_every=1)
         epoch_log = MetricLog()
         for epoch in range(start_epoch, cfg.trainer.epochs):
             net.train()
