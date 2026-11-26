@@ -16,7 +16,6 @@ from jepa_fm.data.datasets import PARQUET_META_KEY, Lesion, PretrainDataset
 from jepa_fm.data.utils import SplitType, VoxelFormat, centroid_crop, load_file
 
 DEFAULT_PARAMS = Path(__file__).parents[3] / "config" / "radiomics.yaml"
-ZERO_VARIANCE_EPS = 1e-8
 
 
 def params_hash(path: str | Path) -> str:
@@ -107,44 +106,6 @@ def _drop_all_nan(
     return features[:, keep], [name for name, kept in zip(names, keep) if kept]
 
 
-def _colinearity(corr: np.ndarray, cutoff: float) -> np.ndarray:
-    keep = np.ones(corr.shape[0], dtype=bool)
-    for j in range(corr.shape[0]):
-        if keep[j] and (np.abs(corr[j, :j][keep[:j]]) >= cutoff).any():
-            keep[j] = False
-    return keep
-
-
-def select_features(
-    features: np.ndarray, names: list[str], cutoff: float = 0.99
-) -> tuple[np.ndarray, list[str], list[dict]]:
-    """((N, F) raw, names) -> (z-scored (N, K), names, per-stage counts)."""
-    x = np.asarray(features, dtype=np.float64)
-    stages: list[dict] = []
-
-    def drop(keep: np.ndarray, stage: str) -> None:
-        nonlocal x, names
-        kept = [name for name, flag in zip(names, keep, strict=True) if flag]
-        stages.append(
-            {"stage": stage, "removed": x.shape[1] - len(kept), "remaining": len(kept)}
-        )
-        x, names = x[:, keep], kept
-
-    drop(np.isfinite(x).all(axis=0), "non_finite")
-    drop(x.std(axis=0) > ZERO_VARIANCE_EPS, "zero_variance")
-    if not names:
-        raise ValueError("selection removed every feature")
-
-    x = (x - x.mean(axis=0)) / x.std(axis=0)
-
-    if cutoff > 0 and len(names) > 1:
-        drop(
-            _colinearity(np.corrcoef(x, rowvar=False), cutoff),
-            f"collinear_{cutoff}",
-        )
-    return x.astype(np.float32), names, stages
-
-
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -167,12 +128,6 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--workers",
         type=int,
         help=f"multi-processes. default {get_optimal_jobs()}",
-    )
-    parser.add_argument(
-        "--collinearity",
-        type=float,
-        default=0.99,
-        help="drop features with |r| >= cutoff, 0 disables",
     )
     parser.add_argument("--limit", type=int, help="first N records only")
     return parser.parse_args(argv)
@@ -215,18 +170,19 @@ def main(argv: list[str] | None = None) -> None:
     n_extracted = int(features.shape[1])
 
     features, names = _drop_all_nan(features, names)
-    finite = np.isfinite(features)
     n_raw = int(features.shape[1])
-    features, names, selection = select_features(features, names, args.collinearity)
-    if n_raw != n_extracted:
-        selection.insert(
-            0,
-            {
-                "stage": "all_nan",
-                "removed": n_extracted - n_raw,
-                "remaining": n_raw,
-            },
-        )
+    # Raw values, dropped only where extraction itself produced no number: the
+    # cache must not depend on which datasets were in this run.
+    keep = np.isfinite(features).all(axis=0)
+    features = features[:, keep]
+    names = [name for name, kept in zip(names, keep, strict=True) if kept]
+    selection = [
+        {
+            "stage": "non_finite",
+            "removed": n_raw - len(names),
+            "remaining": len(names),
+        }
+    ]
 
     out.parent.mkdir(parents=True, exist_ok=True)
     table = pa.table(
@@ -244,11 +200,8 @@ def main(argv: list[str] | None = None) -> None:
         "n_records": len(records),
         "n_features_raw": n_raw,
         "n_features": int(features.shape[1]),
-        "n_nan": int((~finite).sum()),
-        "n_rows_with_nan": int((~finite).any(axis=1).sum()),
         "library": {"pyradiomics": radiomics_version},
         "selection": {
-            "collinearity": args.collinearity,
             "n_in": n_extracted,
             "n_out": int(features.shape[1]),
             "stages": selection,
@@ -265,11 +218,6 @@ def main(argv: list[str] | None = None) -> None:
         f"features {n_extracted} -> {features.shape[1]}: "
         + ", ".join(f"{s['stage']} -{s['removed']}" for s in selection)
     )
-    if meta["n_nan"]:
-        print(
-            f"WARNING: {meta['n_nan']} non-finite values in {meta['n_rows_with_nan']} "
-            f"raw rows, their columns were dropped"
-        )
     print(f"wrote {out}")
 
 

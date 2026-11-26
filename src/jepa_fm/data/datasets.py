@@ -227,6 +227,13 @@ class PretrainDataset(Dataset):
             )
 
         frame = pd.concat(frames.values())
+        # Scaled here, on the cohort that actually trains, so a cache extracted
+        # from one dataset alone stays valid next to any other.
+        std = frame.std(axis=0, ddof=0)
+        constant = list(frame.columns[~np.isfinite(std) | (std <= 0)])
+        if constant:
+            raise RuntimeError(f"radiomics features are constant: {constant[:5]}")
+        frame = (frame - frame.mean(axis=0)) / std
         row_of = {str(uuid): i for i, uuid in enumerate(frame.index)}
         return frame.to_numpy(dtype=np.float32, copy=True), row_of
 
