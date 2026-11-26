@@ -20,6 +20,7 @@ docs/
 .env
 
 # data
+/data/
 *.ckpt
 *.pt
 *.pth
