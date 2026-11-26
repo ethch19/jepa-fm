@@ -1,6 +1,8 @@
 import torch
 import torch.nn as nn
 from timm.models.layers import trunc_normal_, DropPath
+from torch.utils.checkpoint import checkpoint
+
 from .utils import LayerNorm, GRN
 
 
@@ -64,9 +66,11 @@ class ConvNeXtV2(nn.Module):
         dims=[96, 192, 384, 768],
         kernel_sizes=[3, 5, 5, 3],
         drop_path_rate=0.0,
+        checkpoint_blocks=False,
     ):
         super().__init__()
         self.depths = depths
+        self.checkpoint_blocks = checkpoint_blocks
         self.downsample_layers = (
             nn.ModuleList()
         )  # 2x2x2 patchify stem and 3 intermediate downsampling conv layers
@@ -111,7 +115,13 @@ class ConvNeXtV2(nn.Module):
     def forward(self, x):
         for i in range(4):
             x = self.downsample_layers[i](x)
-            x = self.stages[i](x)
+            for block in self.stages[i]:
+                # recompute in backward: activations, not weights, are the limit
+                x = (
+                    checkpoint(block, x, use_reentrant=False)
+                    if self.checkpoint_blocks
+                    else block(x)
+                )
         return x  # (N, C, D / 16, H / 16, W / 16)
 
 
