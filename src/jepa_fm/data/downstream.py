@@ -98,7 +98,14 @@ class EvaluationDataset(Dataset):
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, str]:
         row = self.records[idx]
-        patch = centroid_crop(load_file(row.npy_img_path), row.centroid, self.crop_size)
+        img, centroid = load_file(row.npy_img_path), row.centroid
+        if len(self.crop_size) == 2:
+            if self.voxel_format is VoxelFormat.STANDARD:
+                centroid = centroid[::-1]  # reorder from (x, y, z) to (z, y, x)
+            slice_ = img[int(round(centroid[0]))]  # centroid's slice
+            patch = centroid_crop(slice_, centroid[1:], self.crop_size)
+        else:
+            patch = centroid_crop(img, centroid, self.crop_size)
         # one view: evaluation must not see a randomly transformed image
         return torch.stack([self.transform(patch)]), row.uuid
 
