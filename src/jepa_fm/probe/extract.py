@@ -4,7 +4,7 @@ import torch
 from torch import Tensor
 from torch.utils.data import DataLoader
 
-from jepa_fm.models.utils import forward_latents
+from jepa_fm.models.utils import global_average_pooling
 
 
 @torch.no_grad()
@@ -23,7 +23,7 @@ def extract_embeddings(
     for imgs, _, dataset, _ in loader:
         with torch.autocast(device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
             latents.append(
-                forward_latents(net, imgs.to(device, non_blocking=True))[:, 0]
+                global_average_pooling(net, imgs.to(device, non_blocking=True))[:, 0]
             )
         labels.extend(dataset)
 

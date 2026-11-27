@@ -1,4 +1,3 @@
-import json
 import pandas as pd
 from pathlib import Path
 import numpy as np
@@ -16,7 +15,7 @@ from jepa_fm.data.utils import (
     centroid_crop,
     load_file,
 )
-from jepa_fm.transforms import RandomZoom3D
+from jepa_fm.transforms import RandomZoom
 
 PARQUET_META_KEY = b"jepa_radiomics"
 
@@ -38,12 +37,95 @@ class Lesion(NamedTuple):
     dataset: str  # stem of the metadata file
 
 
+def load_lesions(
+    meta_dir: str | Path,
+    split: SplitType,
+    voxel_format: VoxelFormat,
+) -> list[Lesion]:
+    meta_dir = Path(meta_dir)
+    data_dfs = []
+    for file in meta_dir.rglob("*"):
+        if file.is_file() and file.suffix in _EXTENSIONS:
+            if _is_radiomics_cache(file):
+                continue
+            tabular = load_col_file(
+                file,
+                cols=[
+                    "node_id",
+                    "scan_id",
+                    "cohort",
+                    "npy_img_path",
+                    "npy_seg_path",
+                    "centroid_x",
+                    "centroid_y",
+                    "centroid_z",
+                ],
+            )
+
+            npy_only = tabular["npy_img_path"].str.endswith(".npy", na=False) & tabular[
+                "npy_seg_path"
+            ].str.endswith(".npy", na=False)
+
+            if not npy_only.all():
+                print(f"{file}: dropped {(~npy_only).sum()} rows")
+
+            data_dfs.append(
+                tabular.loc[npy_only & (tabular["cohort"] == split)].assign(
+                    dataset=file.stem
+                )
+            )
+
+    samples = pd.concat(data_dfs, ignore_index=True) if data_dfs else pd.DataFrame()
+
+    if samples.empty:
+        raise RuntimeError(f"No files found under {meta_dir} with {_EXTENSIONS}")
+
+    duplicated = samples["node_id"].duplicated()
+    if duplicated.any():
+        raise RuntimeError(
+            f"{int(duplicated.sum())} duplicate node_id(s) under {meta_dir}, "
+            f"first {samples.loc[duplicated, 'node_id'].iloc[0]!r}"
+        )
+
+    samples = samples.sort_values(by="node_id", ascending=True).reset_index(drop=True)
+
+    match voxel_format:
+        case VoxelFormat.STANDARD:
+            records = [
+                Lesion(
+                    row.node_id,
+                    row.npy_img_path,
+                    row.npy_seg_path,
+                    (row.centroid_x, row.centroid_y, row.centroid_z),
+                    row.dataset,
+                )
+                for row in samples.itertuples(index=False)
+            ]
+        case VoxelFormat.REVERSED:
+            records = [
+                Lesion(
+                    row.node_id,
+                    row.npy_img_path,
+                    row.npy_seg_path,
+                    (row.centroid_z, row.centroid_y, row.centroid_x),
+                    row.dataset,
+                )
+                for row in samples.itertuples(index=False)
+            ]
+        case _:
+            raise RuntimeError("voxel_format not specified when initialising dataset")
+
+    return records
+
+
 class PretrainDataset(Dataset):
+    """(D, H, W) when ``crop_size`` has 3 entries, (H, W) when it has 2."""
+
     @staticmethod
-    def transform(crop_size: tuple[int, int, int]):
+    def transform(crop_size: tuple[int, ...]):
         return v2.Compose(
             [
-                RandomZoom3D(size=crop_size, scale=(0.6, 1)),
+                RandomZoom(size=crop_size, scale=(0.6, 1)),
                 mai_tf.RandAxisFlip(prob=0.5),
                 mai_tf.RandHistogramShift(prob=0.5),
                 mai_tf.RandGaussianSmooth(prob=0.5),
@@ -65,7 +147,7 @@ class PretrainDataset(Dataset):
         self,
         split: SplitType,
         meta_dir: str,
-        crop_size: tuple[int, int, int],
+        crop_size: tuple[int, ...],
         views: int = 1,
         inference: bool = False,
         voxel_format: VoxelFormat = VoxelFormat.REVERSED,
@@ -74,6 +156,7 @@ class PretrainDataset(Dataset):
         self.meta_dir = Path(meta_dir)
         self.views = views
         self.crop_size = tuple(int(round(s)) for s in crop_size)
+        self.spatial_dims = len(self.crop_size)
         self.voxel_format = (
             VoxelFormat[voxel_format.upper()]
             if isinstance(voxel_format, str)
@@ -84,93 +167,17 @@ class PretrainDataset(Dataset):
         else:
             self.transform = PretrainDataset.inf_transform()
 
-        data_dfs = []
-        for file in self.meta_dir.rglob("*"):
-            if file.is_file() and file.suffix in _EXTENSIONS:
-                if _is_radiomics_cache(file):
-                    continue
-                tabular = load_col_file(
-                    file,
-                    cols=[
-                        "node_id",
-                        "scan_id",
-                        "cohort",
-                        "npy_img_path",
-                        "npy_seg_path",
-                        "centroid_x",
-                        "centroid_y",
-                        "centroid_z",
-                    ],
-                )
-
-                npy_only = tabular["npy_img_path"].str.endswith(
-                    ".npy", na=False
-                ) & tabular["npy_seg_path"].str.endswith(".npy", na=False)
-
-                if not npy_only.all():
-                    print(f"{file}: dropped {(~npy_only).sum()} rows")
-
-                data_dfs.append(
-                    tabular.loc[npy_only & (tabular["cohort"] == self.split)].assign(
-                        dataset=file.stem
-                    )
-                )
-
-        samples = pd.concat(data_dfs, ignore_index=True) if data_dfs else pd.DataFrame()
-
-        if samples.empty:
-            raise RuntimeError(
-                f"No files found under {self.meta_dir} with {_EXTENSIONS}"
-            )
-
-        duplicated = samples["node_id"].duplicated()
-        if duplicated.any():
-            raise RuntimeError(
-                f"{int(duplicated.sum())} duplicate node_id(s) under {self.meta_dir}, "
-                f"first {samples.loc[duplicated, 'node_id'].iloc[0]!r}"
-            )
-
-        samples = samples.sort_values(by="node_id", ascending=True).reset_index(
-            drop=True
-        )
-
-        match self.voxel_format:
-            case VoxelFormat.STANDARD:
-                self.records = [
-                    Lesion(
-                        row.node_id,
-                        row.npy_img_path,
-                        row.npy_seg_path,
-                        (row.centroid_x, row.centroid_y, row.centroid_z),
-                        row.dataset,
-                    )
-                    for row in samples.itertuples(index=False)
-                ]
-            case VoxelFormat.REVERSED:
-                self.records = [
-                    Lesion(
-                        row.node_id,
-                        row.npy_img_path,
-                        row.npy_seg_path,
-                        (row.centroid_z, row.centroid_y, row.centroid_x),
-                        row.dataset,
-                    )
-                    for row in samples.itertuples(index=False)
-                ]
-            case _:
-                raise RuntimeError(
-                    "voxel_format not specified when initialising dataset"
-                )
-
+        self.records = load_lesions(self.meta_dir, split, self.voxel_format)
         self.features, self.row_of = self._load_radiomics()
 
     def __len__(self):
         return len(self.records)
 
     def _load_radiomics(self):
-        """Every cache under meta_dir, provided they share one feature space."""
         caches = sorted(
-            path for path in self.meta_dir.rglob("*.parquet") if _is_radiomics_cache(path)
+            path
+            for path in self.meta_dir.rglob("*.parquet")
+            if _is_radiomics_cache(path)
         )
         if not caches:
             return None, {}
@@ -179,17 +186,6 @@ class PretrainDataset(Dataset):
         feature_columns: list[str] | None = None
         for cache_path in caches:
             table = pq.read_table(cache_path)
-            cache_meta = json.loads((table.schema.metadata or {})[PARQUET_META_KEY])
-            for key, value in (
-                ("crop_size", list(self.crop_size)),
-                ("voxel_format", str(self.voxel_format)),
-            ):
-                if cache_meta.get(key) != value:
-                    raise RuntimeError(
-                        f"radiomics cache {cache_path.name}: {key} "
-                        f"{cache_meta.get(key)!r} != dataset {value!r}"
-                    )
-
             frame = table.to_pandas().set_index("uuid")
             repeated = frame.index.duplicated()
             if repeated.any():
@@ -227,8 +223,8 @@ class PretrainDataset(Dataset):
             )
 
         frame = pd.concat(frames.values())
-        # Scaled here, on the cohort that actually trains, so a cache extracted
-        # from one dataset alone stays valid next to any other.
+
+        # z-scaling
         std = frame.std(axis=0, ddof=0)
         constant = list(frame.columns[~np.isfinite(std) | (std <= 0)])
         if constant:
@@ -237,14 +233,24 @@ class PretrainDataset(Dataset):
         row_of = {str(uuid): i for i, uuid in enumerate(frame.index)}
         return frame.to_numpy(dtype=np.float32, copy=True), row_of
 
+    def _patch(self, img: np.ndarray, centroid: tuple[float, ...]) -> np.ndarray:
+        if self.spatial_dims == 2:
+            if self.voxel_format is VoxelFormat.STANDARD:
+                centroid = centroid[::-1]  # reorder from (x, y, z) to (z, y, x)
+            slice_ = img[int(round(centroid[0]))]  # centroid's slice
+            return centroid_crop(slice_, centroid[1:], self.crop_size)[None]
+        return centroid_crop(img, centroid, self.crop_size)
+
     def __getitem__(self, idx: int):
-        """Returns (V, D, H, W) of the same tumour crop"""
+        """Returns (V, *crop_size) of the same tumour crop"""
         row = self.records[idx]
         img = load_file(row.npy_img_path)
 
-        patch = centroid_crop(img, row.centroid, self.crop_size)
+        patch = self._patch(img, row.centroid)
 
-        views = [self.transform(patch) for _ in range(self.views)]
+        views = [
+            self.transform(patch).reshape(self.crop_size) for _ in range(self.views)
+        ]
 
         if self.features is None:
             features = torch.zeros(0)

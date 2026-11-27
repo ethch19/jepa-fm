@@ -52,8 +52,8 @@ def load_col_file(file_path: Path, cols=None) -> pd.DataFrame:
 
 def centroid_crop(
     vol: np.ndarray,
-    centre: tuple[float, float, float],
-    crop_size: tuple[int, int, int],
+    centre: tuple[float, ...],
+    crop_size: tuple[int, ...],
     fill: float = 0,
 ) -> np.ndarray:
     if len(centre) != vol.ndim or len(crop_size) != vol.ndim:

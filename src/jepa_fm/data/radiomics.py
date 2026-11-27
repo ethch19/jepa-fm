@@ -12,8 +12,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from tqdm import tqdm
 
-from jepa_fm.data.datasets import PARQUET_META_KEY, Lesion, PretrainDataset
-from jepa_fm.data.utils import SplitType, VoxelFormat, centroid_crop, load_file
+from jepa_fm.data.datasets import PARQUET_META_KEY, Lesion, load_lesions
+from jepa_fm.data.utils import SplitType, VoxelFormat, load_file
 
 DEFAULT_PARAMS = Path(__file__).parents[3] / "config" / "radiomics.yaml"
 
@@ -79,12 +79,10 @@ def _extractor() -> RadiomicsExtractor:
     return _EXTRACTOR
 
 
-def _extract(
-    task: tuple[Lesion, tuple[int, int, int]],
-) -> tuple[str, list[str], np.ndarray]:
-    record, crop_size = task
-    image = centroid_crop(load_file(record.npy_img_path), record.centroid, crop_size)
-    mask = centroid_crop(load_file(record.npy_mask_path), record.centroid, crop_size)
+def _extract(record: Lesion) -> tuple[str, list[str], np.ndarray]:
+    """Whole image and whole mask: the features never depend on a crop."""
+    image = load_file(record.npy_img_path)
+    mask = load_file(record.npy_mask_path)
     extractor = _extractor()
     try:
         values = extractor(image, mask)
@@ -111,7 +109,6 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--meta-path", required=True, help="directory of csv/parquet metadata"
     )
-    parser.add_argument("--crop-size", required=True, type=int, nargs=3)
     parser.add_argument(
         "--out",
         required=True,
@@ -140,16 +137,9 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit(f"--workers must be 1 or more, got {workers}")
     out = args.out.with_suffix(".parquet")
 
-    dataset = PretrainDataset(
-        SplitType.TRAIN,
-        args.meta_path,
-        tuple(args.crop_size),
-        views=1,
-        inference=True,
-        voxel_format=args.voxel_format,
-    )
-    records = dataset.records[: args.limit]
-    tasks = [(record, dataset.crop_size) for record in records]
+    voxel_format = VoxelFormat(args.voxel_format)
+    records = load_lesions(args.meta_path, SplitType.TRAIN, voxel_format)[: args.limit]
+    tasks = records
 
     started = time.perf_counter()
     if workers > 1:
@@ -194,8 +184,8 @@ def main(argv: list[str] | None = None) -> None:
         "params_path": str(DEFAULT_PARAMS),
         "params_sha256": params_hash(DEFAULT_PARAMS),
         "split": SplitType.TRAIN.value,
-        "crop_size": list(dataset.crop_size),
-        "voxel_format": str(dataset.voxel_format),
+        "voxel_format": str(voxel_format),
+        "region": "full_mask",
         "label": 1,
         "n_records": len(records),
         "n_features_raw": n_raw,

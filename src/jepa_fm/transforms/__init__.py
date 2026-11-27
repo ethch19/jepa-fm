@@ -1,3 +1,3 @@
-from jepa_fm.transforms.crop import RandomZoom3D
+from jepa_fm.transforms.crop import RandomZoom
 
-__all__ = ["RandomZoom3D"]
+__all__ = ["RandomZoom"]

@@ -22,7 +22,7 @@ from jepa_fm.data.downstream import (
     parse_endpoint,
     validate_endpoint,
 )
-from jepa_fm.models.utils import forward_latents
+from jepa_fm.models.utils import global_average_pooling
 from jepa_fm.pretraining.lejepa import AMP_DTYPE, git_sha, mirror_mlflow_env
 
 REPO = Path(__file__).parents[3]
@@ -118,7 +118,7 @@ def extract_cohort(
     uuids: list[str] = []
     for imgs, uuid in tqdm(loader, desc=f"extract {ds.name}", unit="batch", leave=False):
         with torch.autocast(device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
-            latents = forward_latents(net, imgs.to(device, non_blocking=True))[:, 0]
+            latents = global_average_pooling(net, imgs.to(device, non_blocking=True))[:, 0]
         features.append(latents.float().cpu().numpy())
         uuids.extend(uuid)
     return np.concatenate(features), uuids

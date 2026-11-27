@@ -17,7 +17,7 @@ from tqdm import tqdm
 
 from jepa_fm.data.datasets import PretrainDataset
 from jepa_fm.data.utils import SplitType
-from jepa_fm.models.utils import forward_latents
+from jepa_fm.models.utils import global_average_pooling
 from jepa_fm.probe import EmbeddingMetric
 from jepa_fm.probe.extract import extract_embeddings, group_rows
 from jepa_fm.utils import MetricLog, log_metric_figures
@@ -110,7 +110,7 @@ def train_step(
     with torch.autocast(
         imgs.device.type, dtype=amp_dtype, enabled=amp_dtype is not None
     ):
-        latents = forward_latents(net, imgs)
+        latents = global_average_pooling(net, imgs)
 
     b, v = latents.shape[:2]
     proj = projector(latents.float().flatten(0, 1)).view(b, v, -1)

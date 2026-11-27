@@ -87,8 +87,8 @@ class GRN2D(nn.Module):
         return self.gamma * (x * nx) + self.beta + x
 
 
-def forward_latents(net: nn.Module, imgs: torch.Tensor) -> torch.Tensor:
-    """(B, V, D, H, W) volumes -> (B, V, C) latents. Uses global average pooling"""
+def global_average_pooling(net: nn.Module, imgs: torch.Tensor) -> torch.Tensor:
+    """(B, V, *crop_size) crops -> (B, V, C) latents. Uses global average pooling"""
     b, v = imgs.shape[:2]
-    features = net(imgs.flatten(0, 1).unsqueeze(1))  # (B*V, C, d, h, w)
-    return features.mean(dim=(2, 3, 4)).view(b, v, -1)
+    features = net(imgs.flatten(0, 1).unsqueeze(1))  # (B*V, C, *crop_size)
+    return features.mean(dim=tuple(range(2, features.dim()))).view(b, v, -1)
