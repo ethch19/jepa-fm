@@ -59,7 +59,7 @@ loss:
 probe:
   _recursive_: true
   spaces: [enc] # enc, proj
-  samples: 1024
+  samples: 11264 # caps at dataset size
   every_n_ckpt: 1
   group_by: null # null = all, dataset
   metrics:
