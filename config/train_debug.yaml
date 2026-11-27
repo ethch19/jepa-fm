@@ -1,0 +1,91 @@
+defaults:
+  - model: convnextv2_huge
+  - _self_
+  - experiment: null
+
+run_name: lejepa
+seed: 123
+
+model:
+  drop_path_rate: 0.05 # ramped linearly from 0 to specified rate, runs every forward pass
+  checkpoint_blocks: true
+
+data:
+  meta_path: /home/ethch/jepa-fm/data # directory containing parquet/csv files
+  voxel_format: reversed
+  crop_size: [64, 64] # for 2D, must be >=64 due to 4 convnext blocks
+  views: 3
+
+optim:
+  _target_: torch.optim.AdamW
+  lr: 5.0e-4
+  weight_decay: 5.0e-4
+
+scheduler:
+  warmup_steps: 500
+  min_lr_ratio: 1.0e-3 # final lr, as a fraction of optim.lr
+
+projector: # used only to compute loss terms
+  _target_: jepa_fm.models.projector.Projector
+  in_dim: 2816
+  hidden_dim: 2048
+  out_dim: 768
+
+predictor:
+  _target_: jepa_fm.models.predictor.ConditionedPredictor
+  dim: ${projector.in_dim} # must match projector.in_dim
+  depth: 3
+  hidden_dim: ${projector.in_dim}
+  cond_hidden_dim: 1024
+
+loss:
+  _target_: jepa_fm.losses.CompositeLoss
+  _recursive_: true
+  terms:
+    mse:
+      _target_: jepa_fm.losses.LatentMSE
+      pairs: same_lesion # all, same_lesion, diff_lesion
+      order: combination # combination, permutation
+    predicted_mse:
+      _target_: jepa_fm.losses.PredictedMSE
+      pairs: diff_lesion
+      order: combination
+    sigreg: # applies to all
+      _target_: jepa_fm.losses.SIGReg
+      weight: 0.1
+      knots: 17
+      num_proj: 1024
+
+probe:
+  _recursive_: true
+  spaces: [enc] # enc, proj
+  samples: 1024
+  every_n_ckpt: 1
+  group_by: null # null = all, dataset
+  metrics:
+    rankme:
+      _target_: jepa_fm.probe.RankMe
+      eps: 1.0e-7
+    uniform:
+      _target_: jepa_fm.probe.Uniformity
+      num_pairs: 8192
+      seed: 0
+    variance:
+      _target_: jepa_fm.probe.PerDimVariance
+      top_k: 64
+      dead_std: 1.0e-3
+
+trainer:
+  lesions_per_batch: 10
+  num_workers: 8
+  epochs: 100
+  log_every: 50 # step
+  max_grad_norm: 1.0
+  ckpt_interval: 5 # in epochs. last epoch always saved
+  keep_last: 10 # number of ckpts to keep
+  resume_from: null # path to a checkpoint to continue from
+
+loader:
+  persistent_workers: true
+  prefetch_factor: 3
+  pin_memory: true

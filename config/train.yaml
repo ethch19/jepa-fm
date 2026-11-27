@@ -8,7 +8,7 @@ seed: 123
 
 model:
   drop_path_rate: 0.05 # ramped linearly from 0 to specified rate, runs every forward pass
-  checkpoint_blocks: true # recompute blocks in backward: ~2x the batch per GiB, ~no throughput cost
+  checkpoint_blocks: true 
 
 data:
   meta_path: /home/ethch/jepa-fm/data # directory containing parquet/csv files
@@ -76,7 +76,7 @@ probe:
       dead_std: 1.0e-3
 
 trainer:
-  lesions_per_batch: 10 # 10 x 3 views = 30 volumes: 66 of 95 GiB, needs checkpoint_blocks
+  lesions_per_batch: 10
   num_workers: 8
   epochs: 100
   log_every: 50 # step
