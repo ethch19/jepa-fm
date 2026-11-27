@@ -106,6 +106,7 @@ def train_step(
     features: torch.Tensor,
     amp_dtype: torch.dtype | None = None,
     max_grad_norm: float | None = None,
+    term_grad_norms: bool = False,
 ) -> dict[str, float]:
     with torch.autocast(
         imgs.device.type, dtype=amp_dtype, enabled=amp_dtype is not None
@@ -122,22 +123,23 @@ def train_step(
         projector=projector,
     )
 
-    optimiser.zero_grad(set_to_none=True)
-    total.backward()
-
     modules = [net, projector] if predictor is None else [net, projector, predictor]
     params = [
-        p
-        for p in itertools.chain(*(m.parameters() for m in modules))
-        if p.grad is not None
+        p for p in itertools.chain(*(m.parameters() for m in modules)) if p.requires_grad
     ]
+
+    optimiser.zero_grad(set_to_none=True)
+    term_norms = _term_grad_norms(loss_fn, parts, params) if term_grad_norms else {}
+    total.backward()
+
+    grads = [p for p in params if p.grad is not None]
     if max_grad_norm:
         grad_norm = torch.nn.utils.clip_grad_norm_(
-            params, max_grad_norm, error_if_nonfinite=False
+            grads, max_grad_norm, error_if_nonfinite=False
         )
     else:
         grad_norm = torch.linalg.vector_norm(
-            torch.stack([torch.linalg.vector_norm(p.grad) for p in params])
+            torch.stack([torch.linalg.vector_norm(p.grad) for p in grads])
         )
     optimiser.step()
 
@@ -146,7 +148,30 @@ def train_step(
         "grad_norm": float(grad_norm),
     }
     metrics |= {name: value.item() for name, value in parts.items()}
+    metrics |= term_norms
     return metrics
+
+
+def _term_grad_norms(
+    loss_fn: torch.nn.Module, parts: dict[str, torch.Tensor], params: list[torch.Tensor]
+) -> dict[str, float]:
+    """||grad L_term|| per term, one extra backward pass each.
+
+    The global grad_norm hides which term is driving the step: a large invariance
+    gradient next to a near-zero sigreg gradient is the collapse signature.
+    """
+    norms: dict[str, float] = {}
+    for name, value in parts.items():
+        grads = torch.autograd.grad(
+            loss_fn.terms[name].weight * value,
+            params,
+            retain_graph=True,
+            allow_unused=True,
+        )
+        used = [torch.linalg.vector_norm(g) for g in grads if g is not None]
+        if used:
+            norms[f"grad_norm/{name}"] = float(torch.linalg.vector_norm(torch.stack(used)))
+    return norms
 
 
 def flatten_config(tree: dict, prefix: str = "") -> dict[str, str | int | float | bool]:
@@ -421,10 +446,18 @@ def main(cfg: DictConfig) -> None:
                     features.to(device, non_blocking=True),
                     amp_dtype,
                     cfg.trainer.max_grad_norm,
+                    term_grad_norms=cfg.trainer.term_grad_norms
+                    and (step + 1) % cfg.trainer.log_every == 0,
                 )
                 step += 1
                 scheduler.step()
-                progress.set_postfix(**{k: f"{v:.4f}" for k, v in metrics.items()})
+                progress.set_postfix(
+                    **{
+                        k: f"{v:.4f}"
+                        for k, v in metrics.items()
+                        if not k.startswith("grad_norm/")
+                    }
+                )
 
                 if step % cfg.trainer.log_every == 0:
                     metrics_log.log(
