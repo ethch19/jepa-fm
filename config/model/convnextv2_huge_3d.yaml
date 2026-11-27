@@ -1,0 +1,2 @@
+_target_: jepa_fm.models.convnextv2_3d.convnextv2_huge_3d
+in_chans: 1

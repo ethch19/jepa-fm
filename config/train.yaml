@@ -1,5 +1,5 @@
 defaults:
-  - model: convnextv2_huge
+  - model: convnextv2_huge_3d
   - _self_
   - experiment: null
 
